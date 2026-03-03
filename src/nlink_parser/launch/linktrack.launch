@@ -1,0 +1,10 @@
+<launch>
+    <node pkg="nlink_parser" type="linktrack" name="linktrack1" output="screen">
+        <param name="port_name" value="/dev/uwb_linktrack" />
+        <param name="baud_rate" value="921600" />
+
+        <remap from="/nlink_linktrack_nodeframe2" to="/drone1/nlink_linktrack_nodeframe2" />
+        
+    </node>
+</launch>
+

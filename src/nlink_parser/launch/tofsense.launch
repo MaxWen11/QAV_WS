@@ -1,0 +1,10 @@
+<launch>
+  <node pkg="nlink_parser" type="tofsense" name="tofsense0" output="screen">
+    <param name="port_name" type="str" value="/dev/uwb_tof" />
+    <param name="baud_rate" type="int" value="921600" />
+    <param name="inquire_mode" type="bool" value="false" />
+
+    <remap from="/nlink_tofsense_frame0" to="/drone1/nlink_tofsense_frame0" />
+    
+  </node>
+</launch>
