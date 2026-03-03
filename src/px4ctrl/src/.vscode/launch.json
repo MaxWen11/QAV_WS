@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/maxwen/Desktop/Differential_Robotics-main 2/home/Diff-Planner/src/realflight_modules/px4ctrl/src",
+      "program": "/Users/maxwen/Desktop/Differential_Robotics-main 2/home/Diff-Planner/src/realflight_modules/px4ctrl/src/build/Debug/outDebug"
+    }
+  ]
+}
