@@ -43,7 +43,3 @@ add_dependencies(px4ctrl_node quadrotor_msgs)
 target_link_libraries(px4ctrl_node
   ${catkin_LIBRARIES}
 )
-
-catkin_install_python(PROGRAMS thrust_calibrate_scrips/thrust_calibrate.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)

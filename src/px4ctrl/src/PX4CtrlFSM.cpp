@@ -368,27 +368,28 @@ void PX4CtrlFSM::process()
 	}
 	else
 	{
-		switch (param.pose_solver)
-		{
-		case 0:
-			debug_msg = controller.update_alg0(des, odom_data, imu_data, u, bat_data.volt);
-			debug_msg.header.stamp = now_time;
-			debug_pub.publish(debug_msg);
-			break;
-		case 1:
-			debug_msg = controller.update_alg1(des, odom_data, imu_data, u, bat_data.volt);
-			debug_msg.header.stamp = now_time;
-			debug_pub.publish(debug_msg);
-			break;
+		// switch (param.pose_solver)
+		// {
+		// case 0:
+		// 	debug_msg = controller.update_alg0(des, odom_data, imu_data, u, bat_data.volt);
+		// 	debug_msg.header.stamp = now_time;
+		// 	debug_pub.publish(debug_msg);
+		// 	break;
+		// case 1:
+		// 	debug_msg = controller.update_alg1(des, odom_data, imu_data, u, bat_data.volt);
+		// 	debug_msg.header.stamp = now_time;
+		// 	debug_pub.publish(debug_msg);
+		// 	break;
 
-		case 2:
-			controller.update_alg2(des, odom_data, imu_data, u, bat_data.volt);
-			break;
+		// case 2:
+		// 	controller.update_alg2(des, odom_data, imu_data, u, bat_data.volt);
+		// 	break;
 
-		default:
-			ROS_ERROR("Illegal pose_slover selection!");
-			return;
-		}
+		// default:
+		// 	ROS_ERROR("Illegal pose_slover selection!");
+		// 	return;
+		// }
+		debug_msg = controller.update(des, odom_data, imu_data, u, bat_data.volt);
 	}
 
 	// STEP3: estimate thrust model
