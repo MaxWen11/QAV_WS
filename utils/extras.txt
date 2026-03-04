@@ -1,0 +1,8 @@
+echo "[LOADING EXTRAS.TXT]"
+usleep 60000000
+ 
+mavlink stream -d /dev/ttyS3 -s ATTITUDE -r 200
+mavlink stream -d /dev/ttyS3 -s HIGHRES_IMU -r 1000
+mavlink stream -d /dev/ttyS3 -s LOCAL_POSITION_NED -r 150
+ 
+echo "[EXTRAS.TXT EXECUTED]"

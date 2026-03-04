@@ -66,3 +66,45 @@ msg_timeout:
     cmd:  0.5
     imu:  0.5
     bat:  0.5
+
+# ===============================================
+# Online Gaussian Process (Online GP) Parameters
+# ===============================================
+online_gp:
+  l: 0.5               # Lengthscale
+  sigma_f: 1.0         # Signal variance
+  beta: 2.0            # Confidence scaling factor
+  N_max: 50            # Sliding window size
+
+# ===============================================
+# Robust Tube-based MPC (RTMPC) Parameters
+# ===============================================
+rtmpc:
+  dt: 0.05             # Prediction step size
+  H: 20                # Prediction horizon length
+
+  # X/Y axis parameters
+  xy:
+    Q_p: 10.0          # Position tracking penalty
+    Q_v: 1.0           # Velocity tracking penalty
+    R: 0.1             # Control input penalty
+    Q_anc_p: 20.0      # Ancillary LQR position penalty
+    Q_anc_v: 2.0       # Ancillary LQR velocity penalty
+    R_anc: 0.01        # Ancillary LQR control penalty
+    limit_p: 2.0       # State tube base bound (position)
+    limit_v: 2.0       # State tube base bound (velocity)
+    limit_u_min: -3.0  # Control lower bound
+    limit_u_max: 3.0   # Control upper bound
+
+  # Z axis parameters
+  z:
+    Q_p: 15.0
+    Q_v: 2.0
+    R: 0.5
+    Q_anc_p: 30.0
+    Q_anc_v: 5.0
+    R_anc: 0.01
+    limit_p: 1.5
+    limit_v: 1.0
+    limit_u_min: -2.0
+    limit_u_max: 5.0
