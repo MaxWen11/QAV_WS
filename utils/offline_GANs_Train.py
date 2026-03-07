@@ -64,23 +64,29 @@ class Generator_RpGAN(nn.Module):
     def __init__(self):
         super(Generator_RpGAN, self).__init__()
         self.hidden = nn.Sequential(
-            nn.Linear(1, 128),
+            nn.Linear(1, 128), # Input is State (Velocity), matching LaTeX f(x), g(x)
             nn.LayerNorm(128),
             nn.Tanh(),
             nn.Linear(128, 128),
             nn.LayerNorm(128),
             nn.Tanh()
         )
-        self.f_out = nn.Linear(128, 1)
-        self.g_out = nn.Linear(128, 1)
+        # Outputs are Theta1 and Theta2 (Inverse Dynamics Parameters)
+        # u = Theta1 + Theta2 * eta
+        self.theta1_out = nn.Linear(128, 1)
+        self.theta2_out = nn.Linear(128, 1)
 
-        nn.init.constant_(self.f_out.bias, 0.0)
-        nn.init.constant_(self.g_out.bias, 1.0)
+        nn.init.constant_(self.theta1_out.bias, 0.0)
+        nn.init.constant_(self.theta2_out.bias, 1.0)
 
-    def forward(self, v_dot_real):
-        feat = self.hidden(v_dot_real)
-        f = self.f_out(feat)
-        g = F.softplus(self.g_out(feat)) + 0.1
+    def forward(self, v_state):
+        feat = self.hidden(v_state)
+        theta1 = self.theta1_out(feat)
+        theta2 = F.softplus(self.theta2_out(feat)) + 0.1 # Ensure non-singularity
+        
+        # Algebraic matching from Eq. 17: f = -Theta1/Theta2, g = 1/Theta2
+        f = -theta1 / theta2
+        g = 1.0 / theta2
         return f, g
 
 
@@ -108,17 +114,17 @@ print("Loading dataset...")
 try:
     df = pd.read_csv('offline_dataset_combined.csv')
     dataset_dict = {
-        'X': {'v_dot': df['v_dot_x'].values, 'u': df['u_x'].values},
-        'Y': {'v_dot': df['v_dot_y'].values, 'u': df['u_y'].values},
-        'Z': {'v_dot': df['v_dot_z'].values, 'u': df['u_z'].values}
+        'X': {'v': df['v_x'].values, 'v_dot': df['v_dot_x'].values, 'u': df['u_x'].values},
+        'Y': {'v': df['v_y'].values, 'v_dot': df['v_dot_y'].values, 'u': df['u_y'].values},
+        'Z': {'v': df['v_z'].values, 'v_dot': df['v_dot_z'].values, 'u': df['u_z'].values}
     }
 except FileNotFoundError:
     print("Warning: Dataset not found. Using dummy data for testing.")
     dummy_data = np.random.randn(1000)
     dataset_dict = {
-        'X': {'v_dot': dummy_data, 'u': dummy_data},
-        'Y': {'v_dot': dummy_data, 'u': dummy_data},
-        'Z': {'v_dot': dummy_data, 'u': dummy_data}
+        'X': {'v': dummy_data, 'v_dot': dummy_data, 'u': dummy_data},
+        'Y': {'v': dummy_data, 'v_dot': dummy_data, 'u': dummy_data},
+        'Z': {'v': dummy_data, 'v_dot': dummy_data, 'u': dummy_data}
     }
 
 
@@ -128,10 +134,11 @@ except FileNotFoundError:
 def train_axis_dynamics(axis_name, data, config):
     print(f"\n[{axis_name} Axis] Starting {config['gan_type']} training...")
 
+    v_tensor = torch.FloatTensor(data['v']).unsqueeze(1).to(device)
     v_dot_tensor = torch.FloatTensor(data['v_dot']).unsqueeze(1).to(device)
     u_tensor = torch.FloatTensor(data['u']).unsqueeze(1).to(device)
 
-    torch_dataset = Data.TensorDataset(u_tensor, v_dot_tensor)
+    torch_dataset = Data.TensorDataset(u_tensor, v_dot_tensor, v_tensor)
     loader = Data.DataLoader(dataset=torch_dataset, batch_size=config['batch_size'], shuffle=True)
 
     generator = Generator_RpGAN().to(device)
@@ -146,9 +153,9 @@ def train_axis_dynamics(axis_name, data, config):
         g_loss_avg = 0
         d_loss_avg = 0
 
-        for b_u_real, b_vdot_real in loader:
+        for b_u_real, b_vdot_real, b_v_real in loader:
             # Train Discriminator
-            f, g = generator(b_vdot_real)
+            f, g = generator(b_v_real) # Input is State (Velocity)
             eta_fake = f + g * b_u_real
             eta_fake_det = eta_fake.detach()
 
@@ -171,7 +178,7 @@ def train_axis_dynamics(axis_name, data, config):
             d_optimizer.step()
 
             # Train Generator
-            f_g, g_g = generator(b_vdot_real)
+            f_g, g_g = generator(b_v_real)
             eta_fake_g = f_g + g_g * b_u_real
 
             fake_pair_g = torch.cat([eta_fake_g, b_vdot_real], dim=1)

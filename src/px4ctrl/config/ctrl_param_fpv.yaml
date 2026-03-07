@@ -108,3 +108,10 @@ rtmpc:
     limit_v: 1.0
     limit_u_min: -2.0
     limit_u_max: 5.0
+
+# ===============================================
+# Controller Selection
+# ===============================================
+controller:
+  use_mpc: true        # true: RTMPC, false: Uncertainty-Aware PID
+  ua_pid_alpha: 0.5    # Tuning scalar for uncertainty-aware gain scheduling

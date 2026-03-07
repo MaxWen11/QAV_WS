@@ -44,32 +44,26 @@ PX4CtrlFSM::PX4CtrlFSM(Parameter_t &param_, Controller &controller_) : param(par
 
 void PX4CtrlFSM::manage_rosbag(bool start)
 {
-    // 定义录制的话题 (根据你的需求修改)
-    // 注意：这里默认话题是 /drone1/debugPx4ctrl，如果是多机，最好动态获取名字
+ 
     std::string topics = "/drone1/debugPx4ctrl";
     
-    // 定义保存路径 (请确保路径存在！)
+   
     std::string save_path = "/home/maxwen/QAV_WS/"; 
     
-    // 定义录制节点的名称 (方便kill)
     std::string node_name = "auto_recorder_cpp"; 
 
     if (start)
     {
-        if (is_recording) return; // 已经在录了，直接返回
+        if (is_recording) return; 
 
-        // 1. 生成带时间戳的文件名
+        
         time_t now = time(0);
         tm *ltm = localtime(&now);
         char buffer[80];
         strftime(buffer, 80, "drone1_auto_flight_%Y-%m-%d-%H-%M-%S.bag", ltm);
         std::string filename = save_path + std::string(buffer);
 
-        // 2. 构造 rosbag record 命令
-        // 关键点：
-        // -O : 指定文件名
-        // __name:= : 给节点起名，方便后面停止
-        // & : 在后台运行，不要阻塞 C++ 主程序
+       
         std::string cmd = "rosbag record -O " + filename + " " + topics + " __name:=" + node_name + " > /dev/null 2>&1 &";
         
         ROS_INFO("\033[32m[PX4Ctrl] START RECORDING: %s\033[0m", filename.c_str());
@@ -79,9 +73,9 @@ void PX4CtrlFSM::manage_rosbag(bool start)
     }
     else
     {
-        if (!is_recording) return; // 没在录，直接返回
+        if (!is_recording) return; 
 
-        // 3. 构造停止命令 (杀掉节点)
+       
         std::string cmd = "pkill -2 -f " + node_name;
         
         ROS_INFO("\033[33m[PX4Ctrl] STOP RECORDING.\033[0m");
@@ -480,16 +474,15 @@ Desired_State_t PX4CtrlFSM::get_hover_des()
 	Desired_State_t des;
     des.p = filter_p;//hover_pose.head<3>();
     
-    // [修改点]：注入前馈速度
-    // 如果你在 set_hov_with_odom() 里，记得把 manual_vel_sp 设为 Zero
+   
     des.v = filter_v;//manual_vel_sp; 
 
-    des.a = filter_a;//Eigen::Vector3d::Zero(); // 加速度依然保持0，因为二阶导数太噪了
+    des.a = filter_a;
     des.j = Eigen::Vector3d::Zero();
     des.yaw = hover_pose(3);
-    des.yaw_rate = 0.0; // 或者也可以把 yaw_rate 传进来，如果你想更跟手
+    des.yaw_rate = 0.0; 
 
-    // ... debug 代码保持不变 ...
+ 
 
     return des;
 }
@@ -627,11 +620,11 @@ void PX4CtrlFSM::set_hov_with_rc()
     double max_acc = 5.0; // 5 m/s^2
     if (filter_a.norm() > max_acc) filter_a = filter_a.normalized() * max_acc;
 
-    // 3. 积分更新虚拟状态 (欧拉积分)
+ 
     filter_v += filter_a * dt;
     filter_p += filter_v * dt;
     
-    // 处理 Yaw (Yaw通常不需要二阶，一阶或者直接积分就够了)
+
     double yaw_rate = rc_data.ch[3] * param.max_manual_vel * (param.rc_reverse.yaw ? 1 : -1);
     hover_pose(3) += yaw_rate * dt;
 

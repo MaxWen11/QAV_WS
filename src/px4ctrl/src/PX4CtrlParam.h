@@ -96,6 +96,11 @@ public:
     double mpc_z_Q_anc_p, mpc_z_Q_anc_v, mpc_z_R_anc;
     double mpc_z_limit_p, mpc_z_limit_v;
     double mpc_z_limit_u_min, mpc_z_limit_u_max;
+
+    // =========================================================
+    // Uncertainty-Aware PID Parameters
+    bool use_mpc;
+    double ua_pid_alpha;
     // =========================================================
 
     // bool print_dbg;

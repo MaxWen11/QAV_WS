@@ -49,7 +49,7 @@ struct Controller_Output_t
 class OnlineGP {
 public:
     OnlineGP(double l, double sigma_f, double beta, int N_max);
-    void add_data(const Eigen::Vector2d& x, double u, double y);
+    void add_data(const Eigen::Vector2d& x, double u, double y, double f0, double g0);
     void predict(const Eigen::Vector2d& x_query, double u_query, 
                  double f_prior, double g_prior,
                  double& f_post, double& g_post, double& sigma_f, double& sigma_g);
@@ -64,8 +64,24 @@ private:
     std::deque<Eigen::Vector2d> X_buffer;
     std::deque<double> U_buffer;
     std::deque<double> Y_buffer;
+    std::deque<double> F0_buffer;
+    std::deque<double> G0_buffer;
 
     double kernel_se(const Eigen::Vector2d& x1, const Eigen::Vector2d& x2);
+};
+
+// ==========================================================
+// 2. Uncertainty-Aware Gain Scheduling (PID/LQR)
+// ==========================================================
+class UncertaintyAwarePID {
+public:
+    UncertaintyAwarePID(double kp, double kv, double alpha);
+    double compute(double err_p, double err_v, double ref_acc, 
+                   double sigma_f, double sigma_g, double u_prev);
+
+private:
+    double kp_, kv_;
+    double alpha_;
 };
 
 // ==========================================================
@@ -128,6 +144,10 @@ private:
     RTMPC* mpc_y;
     RTMPC* mpc_z;
 
+    UncertaintyAwarePID* pid_x;
+    UncertaintyAwarePID* pid_y;
+    UncertaintyAwarePID* pid_z;
+
     double last_u_x, last_u_y, last_u_z;
 
     // LibTorch Modules
@@ -143,7 +163,7 @@ private:
                           double &thrust) const;
 
     // Unified inference function for LibTorch
-    void get_prior(const Eigen::Vector2d& x, char axis, double& f0, double& g0);
+    void get_prior(double input_val, char axis, double& f0, double& g0);
 };
 
 #endif

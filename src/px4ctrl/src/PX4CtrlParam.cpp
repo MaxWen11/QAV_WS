@@ -95,6 +95,10 @@ void Parameter_t::config_from_ros_handle(const ros::NodeHandle &nh)
     nh.param("rtmpc/z/limit_u_min", mpc_z_limit_u_min, -2.0);
     nh.param("rtmpc/z/limit_u_max", mpc_z_limit_u_max, 5.0);
     // =========================================================
+    
+    // 5. Controller Selection & PID Parameters
+    nh.param("controller/use_mpc", use_mpc, true);
+    nh.param("controller/ua_pid_alpha", ua_pid_alpha, 0.5);
 
     max_angle /= (180.0 / M_PI);
 
