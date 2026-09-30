@@ -20,6 +20,7 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <string>
 
 // ================ Configuration Parameters ================
 static double BASELINE_L = 0.16;
@@ -209,26 +210,32 @@ int main(int argc, char **argv)
   ros::NodeHandle nh("~");
 
   // Load Parameters
+  std::string drone_ns, compass_port;
+  int compass_baud = 115200;
   nh.param("tag_id_head", TAG_ID_HEAD, 11);
   nh.param("ma_window", MA_WINDOW, 1);
   nh.param("map_rotation_offset", MAP_ROTATION_OFFSET, -M_PI / 2.0);
+  nh.param<std::string>("drone_namespace", drone_ns, "drone1");
+  nh.param<std::string>("compass_port", compass_port, "/dev/ttyAMA1");
+  nh.param("compass_baud", compass_baud, 115200);
+  const std::string prefix = "/" + drone_ns + "/";
 
   // Initialize serial port
-  if (!initSerial("/dev/ttyAMA1", 115200)) {
+  if (!initSerial(compass_port.c_str(), compass_baud)) {
       ROS_ERROR("Failed to initialize serial port!");
   }
 
   // Initialize Subscribers
-  ros::Subscriber sub_uwb = nh.subscribe<nlink_parser::LinktrackNodeframe2>("/drone1/nlink_linktrack_nodeframe2", 100, uwbNodeframe2Cb);
-  ros::Subscriber sub_tof = nh.subscribe<nlink_parser::TofsenseFrame0>("/drone1/nlink_tofsense_frame0", 30, tofCallback);
-  ros::Subscriber sub_imu = nh.subscribe<sensor_msgs::Imu>("/drone1/mavros/imu/data", 50, imuCb);
+  ros::Subscriber sub_uwb = nh.subscribe<nlink_parser::LinktrackNodeframe2>(prefix + "nlink_linktrack_nodeframe2", 100, uwbNodeframe2Cb);
+  ros::Subscriber sub_tof = nh.subscribe<nlink_parser::TofsenseFrame0>(prefix + "nlink_tofsense_frame0", 30, tofCallback);
+  ros::Subscriber sub_imu = nh.subscribe<sensor_msgs::Imu>(prefix + "mavros/imu/data", 50, imuCb);
 
   // Initialize Publishers
-  // Publisher 1: MAVROS Vision Pose
-  ros::Publisher pub_pose = nh.advertise<geometry_msgs::PoseStamped>("/drone1/mavros/vision_pose/pose", 30);
-  
+  // Publisher 1: MAVROS Vision Pose (fused by the PX4 EKF2)
+  ros::Publisher pub_pose = nh.advertise<geometry_msgs::PoseStamped>(prefix + "mavros/vision_pose/pose", 30);
+
   // Publisher 2: User Debug / RViz Display
-  ros::Publisher pub_user_pose = nh.advertise<geometry_msgs::PoseStamped>("/drone1/uwb_compass/pose", 30);
+  ros::Publisher pub_user_pose = nh.advertise<geometry_msgs::PoseStamped>(prefix + "uwb_compass/pose", 30);
 
   ros::Rate rate(30.0);
   std::vector<uint8_t> serial_buffer;

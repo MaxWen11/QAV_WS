@@ -2,25 +2,14 @@
 #define __PX4CTRLPARAM_H
 
 #include <ros/ros.h>
+#include <array>
+#include <string>
+#include "online_gp.h"
+#include "tube_mpc.h"
 
 class Parameter_t
 {
 public:
-    struct Gain
-    {
-        double Kp0, Kp1, Kp2;
-        double Kv0, Kv1, Kv2;
-        double Kvi0, Kvi1, Kvi2;
-        double Kvd0, Kvd1, Kvd2;
-        double KAngR, KAngP, KAngY;
-    };
-
-    struct RotorDrag
-    {
-        double x, y, z;
-        double k_thrust_horz;
-    };
-
     struct MsgTimeout
     {
         double odom;
@@ -30,15 +19,15 @@ public:
         double bat;
     };
 
+    // F = K1 * V^K2 * (K3*u^2 + (1-K3)*u) with accurate_thrust_model;
+    // otherwise hover_percentage maps gravity to the normalized thrust.
     struct ThrustMapping
     {
-        bool print_val;
         double K1;
         double K2;
         double K3;
         bool accurate_thrust_model;
         double hover_percentage;
-        bool noisy_imu;
     };
 
     struct RCReverse
@@ -58,14 +47,11 @@ public:
         double speed;
     };
 
-    Gain gain;
-    RotorDrag rt_drag;
     MsgTimeout msg_timeout;
     RCReverse rc_reverse;
     ThrustMapping thr_map;
     AutoTakeoffLand takeoff_land;
 
-    int pose_solver;
     double mass;
     double gra;
     double max_angle;
@@ -73,41 +59,47 @@ public:
     double max_manual_vel;
     double low_voltage;
 
-    // =========================================================
-    // =============== 新增算法参数声明 ========================
-    // =========================================================
+    // Configurations A-D of Section VI-C. The frozen prior participates in
+    // both the GP mean and the task-error covariance (Eq. 18).
+    std::string method = "D";
+    std::array<std::string, 3> prior_paths;
+    std::array<uadl::GPConfig, 3> gp;
+    std::array<uadl::MPCConfig, 3> mpc;
+    std::array<Eigen::Vector2d, 3> physical_input_limits;
 
-    // =========== Online GP 参数 ===========
-    double gp_l;
-    double gp_sigma_f;
-    double gp_beta;
-    int gp_N_max;
-
-    // =========== RTMPC 参数 ===========
-    double mpc_dt;
-    int mpc_H;
-
-    double mpc_xy_Q_p, mpc_xy_Q_v, mpc_xy_R;
-    double mpc_xy_Q_anc_p, mpc_xy_Q_anc_v, mpc_xy_R_anc;
-    double mpc_xy_limit_p, mpc_xy_limit_v;
-    double mpc_xy_limit_u_min, mpc_xy_limit_u_max;
-
-    double mpc_z_Q_p, mpc_z_Q_v, mpc_z_R;
-    double mpc_z_Q_anc_p, mpc_z_Q_anc_v, mpc_z_R_anc;
-    double mpc_z_limit_p, mpc_z_limit_v;
-    double mpc_z_limit_u_min, mpc_z_limit_u_max;
-
-    // =========================================================
-    // Uncertainty-Aware PID Parameters
-    bool use_mpc;
-    double ua_pid_alpha;
-    // =========================================================
-
-    // bool print_dbg;
+    // Residual budget of Theorem 2 and Eq. (44), per axis, SI units.
+    struct ResidualBounds {
+        double rkhs_norm = 0.72;              // B for the learned prior (A, B, D)
+        double rkhs_norm_nominal = 0.95;      // B for f0=0, g0=1 (C)
+        double disturbance = 0.25;            // d
+        double measurement = 0.10;            // IMU label error
+        double state_error = 0.03;            // e_x
+        double synchronization = 0.02;        // e_sync
+        double command_modification = 0.10;  // c: gain floor, saturation, mapping
+        double hold_error = 0.05;             // intersample/reference discretization
+        double lipschitz_f = 0.8;
+        double lipschitz_g = 0.1;
+        double prior_abs_f = 2.0;
+        double prior_min_g = 0.5;
+        double prior_max_g = 2.0;
+        double reference_acceleration = 1.5;
+        double min_envelope = 0.5;
+        double max_envelope = 1.85;
+        double fixed_envelope = 1.5;          // configuration B
+    };
+    std::array<ResidualBounds, 3> bounds;
+    uadl::State analysis_lower;
+    uadl::State analysis_upper;
+    double gain_floor = 0.5;
+    double predicted_input_radius = 1.0;
+    double sensor_max_skew = 0.02;
+    double input_delay = 0.0;
+    double command_max_age = 0.03;
+    double solver_cutoff = 0.0085;
+    double control_deadline = 0.01;
 
     Parameter_t();
     void config_from_ros_handle(const ros::NodeHandle &nh);
-    void config_full_thrust(double hov);
 
 private:
     template <typename TName, typename TVal>

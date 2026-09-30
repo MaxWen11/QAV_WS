@@ -1,13 +1,18 @@
 <launch>
-
-	<node pkg="px4ctrl" type="px4ctrl_node" name="px4ctrl" output="screen">
-        	<!-- <remap from="~odom" to="/vicon_imu_ekf_odom" /> -->
-			
-			<remap from="~odom" to="/drone1/mavros/local_position/odom" />
-
-		<remap from="~cmd" to="/drone1/position_cmd" />
-
-        <rosparam command="load" file="$(find px4ctrl)/config/ctrl_param_fpv.yaml" />
-	</node>
- 
+  <arg name="drone_namespace" default="drone1" />
+  <arg name="config" default="$(find px4ctrl)/config/ctrl_param_fpv.yaml" />
+  <!-- A: GAN prior + LMPC, B: GAN prior + fixed tube, C: nominal prior + GP, D: GAN prior + GP -->
+  <arg name="method" default="D" />
+  <arg name="model_dir" default="$(find px4ctrl)/models" />
+  <group ns="$(arg drone_namespace)">
+    <node pkg="px4ctrl" type="px4ctrl_node" name="px4ctrl" output="screen">
+      <remap from="~odom" to="mavros/local_position/odom" />
+      <remap from="~cmd" to="position_cmd" />
+      <rosparam command="load" file="$(arg config)" />
+      <param name="controller/method" type="str" value="$(arg method)" />
+      <param name="prior/model_x" type="str" value="$(arg model_dir)/generator_prior_X.pt" />
+      <param name="prior/model_y" type="str" value="$(arg model_dir)/generator_prior_Y.pt" />
+      <param name="prior/model_z" type="str" value="$(arg model_dir)/generator_prior_Z.pt" />
+    </node>
+  </group>
 </launch>

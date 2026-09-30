@@ -205,10 +205,10 @@ include_directories(
 
 ## Add folders to be run by python nosetests
 # catkin_add_nosetests(test)
-# 声明我们的可执行文件
+# UWB/compass bridge executable
 add_executable(uwb_bridge_node src/uwb_bridge_node.cpp)
 
-# 链接它所需要的库
+# Link against catkin libraries
 target_link_libraries(uwb_bridge_node
   ${catkin_LIBRARIES}
 )

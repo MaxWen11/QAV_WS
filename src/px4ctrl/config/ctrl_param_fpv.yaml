@@ -1,16 +1,16 @@
 #########################################################################
-# ⭐⭐⭐  Set parameters carefully for satisfied performance!   ⭐⭐⭐ #
+# UADL-QAV250 controller configuration (Sections IV-B, V and VI-C).     #
+# Units: SI. Axes: x, y horizontal; z vertical (ENU inertial frame).    #
 #########################################################################
 
-mass        : 1.233 # kg 
-gra         : 9.81 
-pose_solver : 1    # 1:From ZhepeiWang, 2:From rotor-drag    
-ctrl_freq_max   : 100.0
-max_manual_vel: 2.0
-max_angle: 80  # Attitude angle limit in degree. A negative value means no limit.
-low_voltage: 14.0 # 4S battery
+mass        : 0.9    # kg, QAV250 nominal mass m0
+gra         : 9.81   # m/s^2
+ctrl_freq_max   : 100.0  # Hz, control and sampling rate
+max_manual_vel: 2.0  # m/s, RC stick velocity in AUTO_HOVER
+max_angle: 80        # deg, attitude limit of the thrust/attitude mapping
+low_voltage: 14.0    # V, 4S battery; lowest voltage of the thrust model
 
-rc_reverse: # *
+rc_reverse:
     roll: false
     pitch: true
     yaw: false
@@ -20,83 +20,75 @@ auto_takeoff_land:
     enable: true
     enable_auto_arm: true
     no_RC: false
-    takeoff_height: 0.5 # m
-    takeoff_land_speed: 0.2 # m/s
+    takeoff_height: 0.5      # m
+    takeoff_land_speed: 0.2  # m/s
 
-thrust_model: # The model that maps thrust signal u(0~1) to real thrust force F(Unit:N): F=K1*Voltage^K2*(K3*u^2+(1-K3)*u). 
-    print_value: false # display the value of “thr_scale_compensate” or “hover_percentage” during thrust model estimating.
-    accurate_thrust_model: false  # This can always enabled if don't require accurate control performance :-)
-    noisy_imu: false
-    # accurate thrust mapping parameters
-    K1: 2.10  # Needs precise calibration!
-    K2: 1.0 # Needs precise calibration!
-    K3: 0.0 # Needs precise calibration! K3 equals THR_MDL_FAC in https://docs.L_Ctrl.io/master/en/config_mc/pid_tuning_guide_multicopter.html.
-    # approximate thrust mapping parameters
-    hover_percentage: 0.5 # Thrust percentage in Stabilize/Arco mode # *
+thrust_model:
+    # F = K1 * V^K2 * (K3*u^2 + (1-K3)*u) with accurate_thrust_model: true;
+    # otherwise hover_percentage maps gravity to the normalized thrust.
+    accurate_thrust_model: false
+    K1: 2.10
+    K2: 1.0
+    K3: 0.0
+    hover_percentage: 0.5
 
-gain: 
-    # Cascade PID controller. Recommend to read the code.
-    Kp0: 3.7    #3.7
-    Kp1: 3.5    #3.5
-    Kp2: 3.0
-    Kv0: 4.5       #4.5
-    Kv1: 4.5       #4.5
-    Kv2: 4.5
-    # ↓↓↓ No use now --
-    Kvi0: 0.0
-    Kvi1: 0.0
-    Kvi2: 0.0
-    Kvd0: 0.0
-    Kvd1: 0.0
-    Kvd2: 0.0
-    # ↓↓↓ Only used in rate control mode.
-    KAngR: 20.0
-    KAngP: 20.0
-    KAngY: 4.0
-
-rotor_drag:  
-    x: 0.0  # The reduced acceleration on each axis caused by rotor drag. Unit:(m*s^-2)/(m*s^-1).
-    y: 0.0  # Same as above
-    z: 0.0  # Same as above
-    k_thrust_horz: 0.0 # Set to 0 recommended... --
-
-msg_timeout:
+msg_timeout:   # s
     odom: 0.5
     rc:   0.5
     cmd:  0.5
     imu:  0.5
     bat:  0.5
 
-# ===============================================
-# Online Gaussian Process (Online GP) Parameters
-# ===============================================
+controller:
+  # A: GAN prior + LMPC; B: GAN prior + fixed-envelope tube MPC;
+  # C: nominal prior (f0=0, g0=1) + online GP + adaptive tube MPC;
+  # D: GAN prior + online GP + adaptive tube MPC (proposed method).
+  method: D
+  solver_cutoff: 0.0085      # s from cycle start, shared by the three axes
+  deadline: 0.010            # s; late commands are discarded
+
+prior:
+  # TorchScript priors exported by utils/offline_GANs_Train.py, mapping
+  # float32[N,6] = [px,py,pz,vx,vy,vz] to (f0[N,1], g0[N,1]). run_ctrl.launch
+  # sets these paths to $(find px4ctrl)/models/generator_prior_{X,Y,Z}.pt.
+  model_x: ""
+  model_y: ""
+  model_z: ""
+
 online_gp:
-  l: 0.5               # Lengthscale
-  sigma_f: 1.0         # Signal variance
-  beta: 2.0            # Confidence scaling factor
-  N_max: 50            # Sliding window size
+  l: 0.5                     # SE lengthscale on the 6-D state
+  variance_a: 1.0            # signal variance of k_a
+  variance_b: 1.0            # signal variance of k_b
+  noise_variance: 0.01       # working likelihood Sigma_e = sigma_on^2 I
+  N_max: 50                  # retained observations per axis
+  minimum_sample_interval: 0.01  # s, insertion rate up to 100 Hz
+  gain_floor: 0.5            # protected inverse denominator
+  predicted_input_radius: 1.0  # m/s^2, input range around the last command over the horizon
+  max_sensor_skew: 0.02      # s, odometry/IMU stamp alignment
+  input_delay: 0.0           # s, command-to-response delay
+  command_max_age: 0.03      # s, oldest command paired with a label
 
-# ===============================================
-# Robust Tube-based MPC (RTMPC) Parameters
-# ===============================================
 rtmpc:
-  dt: 0.05             # Prediction step size
-  H: 20                # Prediction horizon length
-
-  # X/Y axis parameters
+  dt: 0.01                   # s, same period as the controller
+  H: 20
+  tube_contraction: 0.999    # lambda in A_K Z0 (+) W0 <= lambda Z0
+  max_tube_faces: 64
+  slack_linear_weight: 1000.0
+  slack_quadratic_weight: 10000.0
+  state_estimation_radius: 0.0  # m, tube containment radius of the estimator error
   xy:
-    Q_p: 10.0          # Position tracking penalty
-    Q_v: 1.0           # Velocity tracking penalty
-    R: 0.1             # Control input penalty
-    Q_anc_p: 20.0      # Ancillary LQR position penalty
-    Q_anc_v: 2.0       # Ancillary LQR velocity penalty
-    R_anc: 0.01        # Ancillary LQR control penalty
-    limit_p: 2.0       # State tube base bound (position)
-    limit_v: 2.0       # State tube base bound (velocity)
-    limit_u_min: -3.0  # Control lower bound
-    limit_u_max: 3.0   # Control upper bound
-
-  # Z axis parameters
+    Q_p: 10.0
+    Q_v: 1.0
+    R: 0.1
+    Q_anc_p: 20.0
+    Q_anc_v: 2.0
+    R_anc: 0.01
+    limit_p: 2.0             # m, position-error limit
+    limit_v: 2.0             # m/s, velocity-error limit
+    limit_u_min: -3.0        # m/s^2, physical net acceleration
+    limit_u_max: 3.0
+    correction_min: -3.0     # m/s^2, correction-input set V
+    correction_max: 3.0
   z:
     Q_p: 15.0
     Q_v: 2.0
@@ -108,10 +100,71 @@ rtmpc:
     limit_v: 1.0
     limit_u_min: -2.0
     limit_u_max: 5.0
+    correction_min: -2.0
+    correction_max: 5.0
 
-# ===============================================
-# Controller Selection
-# ===============================================
-controller:
-  use_mpc: true        # true: RTMPC, false: Uncertainty-Aware PID
-  ua_pid_alpha: 0.5    # Tuning scalar for uncertainty-aware gain scheduling
+bounds:
+  # Analysis domain X (Assumption 1), [px, py, pz, vx, vy, vz]: 10 x 10 m arena.
+  state_lower: [-5.0, -5.0, -0.5, -3.0, -3.0, -2.0]
+  state_upper: [ 5.0,  5.0,  3.5,  3.0,  3.0,  2.0]
+  # Residual budget of Theorem 2 and Eq. (44), m/s^2 unless noted.
+  #   rkhs_norm / rkhs_norm_nominal: B for the GAN prior (A, B, D) / nominal prior (C)
+  #   disturbance d, measurement eps, state_error e_x (m, m/s), synchronization,
+  #   command_modification c, hold_error, lipschitz_f/g (1/s),
+  #   prior_abs_f, prior_min_g, prior_max_g: envelope of the frozen prior,
+  #   reference_acceleration: feed-forward limit,
+  #   min/max_envelope: admissible tube scaling, fixed_envelope: configuration B.
+  x:
+    rkhs_norm: 0.72
+    rkhs_norm_nominal: 0.95
+    disturbance: 0.25
+    measurement: 0.10
+    state_error: 0.03
+    synchronization: 0.02
+    command_modification: 0.10
+    hold_error: 0.05
+    lipschitz_f: 0.8
+    lipschitz_g: 0.1
+    prior_abs_f: 2.0
+    prior_min_g: 0.5
+    prior_max_g: 2.0
+    reference_acceleration: 1.5
+    min_envelope: 0.5
+    max_envelope: 1.85
+    fixed_envelope: 1.5
+  y:
+    rkhs_norm: 0.72
+    rkhs_norm_nominal: 0.95
+    disturbance: 0.25
+    measurement: 0.10
+    state_error: 0.03
+    synchronization: 0.02
+    command_modification: 0.10
+    hold_error: 0.05
+    lipschitz_f: 0.8
+    lipschitz_g: 0.1
+    prior_abs_f: 2.0
+    prior_min_g: 0.5
+    prior_max_g: 2.0
+    reference_acceleration: 1.5
+    min_envelope: 0.5
+    max_envelope: 1.85
+    fixed_envelope: 1.5
+  z:
+    rkhs_norm: 0.40
+    rkhs_norm_nominal: 0.60
+    disturbance: 0.20
+    measurement: 0.08
+    state_error: 0.03
+    synchronization: 0.02
+    command_modification: 0.08
+    hold_error: 0.04
+    lipschitz_f: 0.8
+    lipschitz_g: 0.1
+    prior_abs_f: 2.0
+    prior_min_g: 0.5
+    prior_max_g: 2.0
+    reference_acceleration: 0.5
+    min_envelope: 0.4
+    max_envelope: 1.45
+    fixed_envelope: 1.2

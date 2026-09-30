@@ -56,3 +56,29 @@ float64 real_z
 float64 real_vx
 float64 real_vy
 float64 real_vz
+
+# UADL online diagnostics. des_a_* is the executed net inertial acceleration
+# reconstructed from the final attitude/thrust command; fb_a_* is the measured
+# net inertial acceleration (IMU specific force rotated into the world frame).
+bool controller_valid
+bool used_backup
+bool gp_sample_inserted
+bool gp_sample_rejected
+bool envelope_saturated
+bool inside_analysis_domain
+string online_status
+float64 cycle_ms
+float64[3] eta
+float64[3] gp_f
+float64[3] gp_g
+float64[3] gp_cov_fg
+float64[3] response_sigma
+float64[3] response_error_bound
+float64[3] residual_envelope
+float64[3] command_error
+float64[3] nominal_position_error
+float64[3] tube_position_radius
+float64[3] tube_velocity_radius
+float64[3] input_reserve
+float64[3] tracking_slack
+uint32[3] gp_window_size

@@ -1,4 +1,28 @@
 #include "PX4CtrlParam.h"
+#include <cmath>
+#include <vector>
+
+namespace {
+// Per-axis residual budget. The horizontal axes share one budget; the
+// vertical axis has its own input range and disturbance level.
+Parameter_t::ResidualBounds defaultBounds(int axis)
+{
+    Parameter_t::ResidualBounds b;
+    if (axis == 2) {
+        b.rkhs_norm = 0.40;
+        b.rkhs_norm_nominal = 0.60;
+        b.disturbance = 0.20;
+        b.measurement = 0.08;
+        b.command_modification = 0.08;
+        b.hold_error = 0.04;
+        b.reference_acceleration = 0.5;
+        b.min_envelope = 0.4;
+        b.max_envelope = 1.45;
+        b.fixed_envelope = 1.2;
+    }
+    return b;
+}
+} // namespace
 
 Parameter_t::Parameter_t()
 {
@@ -6,31 +30,12 @@ Parameter_t::Parameter_t()
 
 void Parameter_t::config_from_ros_handle(const ros::NodeHandle &nh)
 {
-    read_essential_param(nh, "gain/Kp0", gain.Kp0);
-    read_essential_param(nh, "gain/Kp1", gain.Kp1);
-    read_essential_param(nh, "gain/Kp2", gain.Kp2);
-    read_essential_param(nh, "gain/Kv0", gain.Kv0);
-    read_essential_param(nh, "gain/Kv1", gain.Kv1);
-    read_essential_param(nh, "gain/Kv2", gain.Kv2);
-    read_essential_param(nh, "gain/Kvi0", gain.Kvi0);
-    read_essential_param(nh, "gain/Kvi1", gain.Kvi1);
-    read_essential_param(nh, "gain/Kvi2", gain.Kvi2);
-    read_essential_param(nh, "gain/KAngR", gain.KAngR);
-    read_essential_param(nh, "gain/KAngP", gain.KAngP);
-    read_essential_param(nh, "gain/KAngY", gain.KAngY);
-
-    read_essential_param(nh, "rotor_drag/x", rt_drag.x);
-    read_essential_param(nh, "rotor_drag/y", rt_drag.y);
-    read_essential_param(nh, "rotor_drag/z", rt_drag.z);
-    read_essential_param(nh, "rotor_drag/k_thrust_horz", rt_drag.k_thrust_horz);
-
     read_essential_param(nh, "msg_timeout/odom", msg_timeout.odom);
     read_essential_param(nh, "msg_timeout/rc", msg_timeout.rc);
     read_essential_param(nh, "msg_timeout/cmd", msg_timeout.cmd);
     read_essential_param(nh, "msg_timeout/imu", msg_timeout.imu);
     read_essential_param(nh, "msg_timeout/bat", msg_timeout.bat);
 
-    read_essential_param(nh, "pose_solver", pose_solver);
     read_essential_param(nh, "mass", mass);
     read_essential_param(nh, "gra", gra);
     read_essential_param(nh, "ctrl_freq_max", ctrl_freq_max);
@@ -49,56 +54,106 @@ void Parameter_t::config_from_ros_handle(const ros::NodeHandle &nh)
     read_essential_param(nh, "auto_takeoff_land/takeoff_height", takeoff_land.height);
     read_essential_param(nh, "auto_takeoff_land/takeoff_land_speed", takeoff_land.speed);
 
-    read_essential_param(nh, "thrust_model/print_value", thr_map.print_val);
     read_essential_param(nh, "thrust_model/K1", thr_map.K1);
     read_essential_param(nh, "thrust_model/K2", thr_map.K2);
     read_essential_param(nh, "thrust_model/K3", thr_map.K3);
     read_essential_param(nh, "thrust_model/accurate_thrust_model", thr_map.accurate_thrust_model);
     read_essential_param(nh, "thrust_model/hover_percentage", thr_map.hover_percentage);
-    read_essential_param(nh, "thrust_model/noisy_imu", thr_map.noisy_imu);
-    
-    // =========================================================
-    // =============== 新增算法参数读取 ========================
-    // =========================================================
 
-    // 1. 加载 Online GP 参数
-    nh.param("online_gp/l", gp_l, 0.5);
-    nh.param("online_gp/sigma_f", gp_sigma_f, 1.0);
-    nh.param("online_gp/beta", gp_beta, 2.0);
-    nh.param("online_gp/N_max", gp_N_max, 50);
+    nh.param<std::string>("controller/method", method, "D");
+    nh.param("controller/solver_cutoff", solver_cutoff, 0.0085);
+    nh.param("controller/deadline", control_deadline, 0.01);
+    nh.param("online_gp/gain_floor", gain_floor, 0.5);
+    nh.param("online_gp/predicted_input_radius", predicted_input_radius, 1.0);
+    nh.param("online_gp/max_sensor_skew", sensor_max_skew, 0.02);
+    nh.param("online_gp/input_delay", input_delay, 0.0);
+    nh.param("online_gp/command_max_age", command_max_age, 0.03);
 
-    // 2. 加载 RTMPC 整体参数
-    nh.param("rtmpc/dt", mpc_dt, 0.05);
-    nh.param("rtmpc/H", mpc_H, 20);
+    // Analysis domain X of Assumption 1: [p_x, p_y, p_z, v_x, v_y, v_z].
+    const std::vector<double> default_lower{-5.0, -5.0, -0.5, -3.0, -3.0, -2.0};
+    const std::vector<double> default_upper{5.0, 5.0, 3.5, 3.0, 3.0, 2.0};
+    std::vector<double> lower, upper;
+    nh.param("bounds/state_lower", lower, default_lower);
+    nh.param("bounds/state_upper", upper, default_upper);
+    if (lower.size() != 6 || upper.size() != 6) {
+        ROS_WARN("bounds/state_lower and state_upper need six entries; using the arena defaults.");
+        lower = default_lower;
+        upper = default_upper;
+    }
+    for (int j = 0; j < 6; ++j) {
+        analysis_lower(j) = lower[j];
+        analysis_upper(j) = upper[j];
+    }
 
-    // 3. 加载 RTMPC X/Y 轴参数
-    nh.param("rtmpc/xy/Q_p", mpc_xy_Q_p, 10.0);
-    nh.param("rtmpc/xy/Q_v", mpc_xy_Q_v, 1.0);
-    nh.param("rtmpc/xy/R", mpc_xy_R, 0.1);
-    nh.param("rtmpc/xy/Q_anc_p", mpc_xy_Q_anc_p, 20.0);
-    nh.param("rtmpc/xy/Q_anc_v", mpc_xy_Q_anc_v, 2.0);
-    nh.param("rtmpc/xy/R_anc", mpc_xy_R_anc, 0.01);
-    nh.param("rtmpc/xy/limit_p", mpc_xy_limit_p, 2.0);
-    nh.param("rtmpc/xy/limit_v", mpc_xy_limit_v, 2.0);
-    nh.param("rtmpc/xy/limit_u_min", mpc_xy_limit_u_min, -3.0);
-    nh.param("rtmpc/xy/limit_u_max", mpc_xy_limit_u_max, 3.0);
+    const std::array<std::string, 3> axes{{"x", "y", "z"}};
+    for (int i = 0; i < 3; ++i) {
+        auto& g = gp[i];
+        auto& m = mpc[i];
+        auto& b = bounds[i];
+        const auto d = defaultBounds(i);
+        const bool vertical = i == 2;
+        const std::string prefix = std::string("rtmpc/") + (vertical ? "z/" : "xy/");
 
-    // 4. 加载 RTMPC Z 轴参数
-    nh.param("rtmpc/z/Q_p", mpc_z_Q_p, 15.0);
-    nh.param("rtmpc/z/Q_v", mpc_z_Q_v, 2.0);
-    nh.param("rtmpc/z/R", mpc_z_R, 0.5);
-    nh.param("rtmpc/z/Q_anc_p", mpc_z_Q_anc_p, 30.0);
-    nh.param("rtmpc/z/Q_anc_v", mpc_z_Q_anc_v, 5.0);
-    nh.param("rtmpc/z/R_anc", mpc_z_R_anc, 0.01);
-    nh.param("rtmpc/z/limit_p", mpc_z_limit_p, 1.5);
-    nh.param("rtmpc/z/limit_v", mpc_z_limit_v, 1.0);
-    nh.param("rtmpc/z/limit_u_min", mpc_z_limit_u_min, -2.0);
-    nh.param("rtmpc/z/limit_u_max", mpc_z_limit_u_max, 5.0);
-    // =========================================================
-    
-    // 5. Controller Selection & PID Parameters
-    nh.param("controller/use_mpc", use_mpc, true);
-    nh.param("controller/ua_pid_alpha", ua_pid_alpha, 0.5);
+        nh.param("online_gp/l", g.lengthscale, 0.5);
+        nh.param("online_gp/variance_a", g.variance_a, 1.0);
+        nh.param("online_gp/variance_b", g.variance_b, 1.0);
+        nh.param("online_gp/noise_variance", g.noise_variance, 0.01);
+        nh.param("online_gp/minimum_sample_interval", g.minimum_sample_interval, 0.01);
+        int window = 50;
+        nh.param("online_gp/N_max", window, 50);
+        g.max_samples = window > 0 ? static_cast<std::size_t>(window) : 0;
+
+        nh.param("rtmpc/dt", m.dt, 0.01);
+        nh.param("rtmpc/H", m.horizon, 20);
+        nh.param("rtmpc/tube_contraction", m.tube_contraction, 0.999);
+        nh.param("rtmpc/max_tube_faces", m.max_tube_faces, 64);
+        nh.param("rtmpc/slack_linear_weight", m.slack_linear_weight, 1.0e3);
+        nh.param("rtmpc/slack_quadratic_weight", m.slack_quadratic_weight, 1.0e4);
+        nh.param("rtmpc/state_estimation_radius", m.state_estimation_bound, 0.0);
+        nh.param(prefix + "Q_p", m.Q_diag(0), vertical ? 15.0 : 10.0);
+        nh.param(prefix + "Q_v", m.Q_diag(1), vertical ? 2.0 : 1.0);
+        nh.param(prefix + "R", m.R, vertical ? 0.5 : 0.1);
+        nh.param(prefix + "Q_anc_p", m.Q_anc_diag(0), vertical ? 30.0 : 20.0);
+        nh.param(prefix + "Q_anc_v", m.Q_anc_diag(1), vertical ? 5.0 : 2.0);
+        nh.param(prefix + "R_anc", m.R_anc, 0.01);
+        nh.param(prefix + "limit_p", m.state_limits(0), vertical ? 1.5 : 2.0);
+        nh.param(prefix + "limit_v", m.state_limits(1), vertical ? 1.0 : 2.0);
+        nh.param(prefix + "limit_u_min", physical_input_limits[i](0), vertical ? -2.0 : -3.0);
+        nh.param(prefix + "limit_u_max", physical_input_limits[i](1), vertical ? 5.0 : 3.0);
+        nh.param(prefix + "correction_min", m.correction_domain(0), physical_input_limits[i](0));
+        nh.param(prefix + "correction_max", m.correction_domain(1), physical_input_limits[i](1));
+
+        const std::string bp = "bounds/" + axes[i] + "/";
+        nh.param(bp + "rkhs_norm", b.rkhs_norm, d.rkhs_norm);
+        nh.param(bp + "rkhs_norm_nominal", b.rkhs_norm_nominal, d.rkhs_norm_nominal);
+        nh.param(bp + "disturbance", b.disturbance, d.disturbance);
+        nh.param(bp + "measurement", b.measurement, d.measurement);
+        nh.param(bp + "state_error", b.state_error, d.state_error);
+        nh.param(bp + "synchronization", b.synchronization, d.synchronization);
+        nh.param(bp + "command_modification", b.command_modification, d.command_modification);
+        nh.param(bp + "hold_error", b.hold_error, d.hold_error);
+        nh.param(bp + "lipschitz_f", b.lipschitz_f, d.lipschitz_f);
+        nh.param(bp + "lipschitz_g", b.lipschitz_g, d.lipschitz_g);
+        nh.param(bp + "prior_abs_f", b.prior_abs_f, d.prior_abs_f);
+        nh.param(bp + "prior_min_g", b.prior_min_g, d.prior_min_g);
+        nh.param(bp + "prior_max_g", b.prior_max_g, d.prior_max_g);
+        nh.param(bp + "reference_acceleration", b.reference_acceleration, d.reference_acceleration);
+        nh.param(bp + "min_envelope", b.min_envelope, d.min_envelope);
+        nh.param(bp + "max_envelope", b.max_envelope, d.max_envelope);
+        nh.param(bp + "fixed_envelope", b.fixed_envelope, d.fixed_envelope);
+        nh.param<std::string>("prior/model_" + axes[i], prior_paths[i], "");
+
+        // Configuration C uses the nominal net-acceleration prior f0=0, g0=1.
+        if (method == "C") {
+            b.prior_abs_f = 0.0;
+            b.prior_min_g = b.prior_max_g = 1.0;
+        }
+        g.rkhs_bound = method == "C" ? b.rkhs_norm_nominal : b.rkhs_norm;
+        // Configuration A is the nominal LMPC baseline without a tube.
+        m.max_envelope = method == "A" ? 0.0 : b.max_envelope;
+        m.min_envelope = method == "A" ? 0.0 : b.min_envelope;
+        if (method == "A") m.state_estimation_bound = 0.0;
+    }
 
     max_angle /= (180.0 / M_PI);
 
@@ -111,10 +166,5 @@ void Parameter_t::config_from_ros_handle(const ros::NodeHandle &nh)
     {
         takeoff_land.no_RC = false;
         ROS_ERROR("\"no_RC\" is only allowd with both \"auto_takeoff_land\" and \"enable_auto_arm\" enabled.");
-    }
-
-    if ( thr_map.print_val )
-    {
-        ROS_WARN("You should disable \"print_value\" if you are in regular usage.");
     }
 };
