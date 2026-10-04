@@ -59,42 +59,40 @@ public:
     double max_manual_vel;
     double low_voltage;
 
-    // Configurations A-D of Section VI-C. The frozen prior participates in
-    // both the GP mean and the task-error covariance (Eq. 18).
-    std::string method = "D";
+    // Frozen offline priors (Eq. 15); the prior enters both the GP mean and
+    // the task-error covariance (Eq. 18).
     std::array<std::string, 3> prior_paths;
     std::array<uadl::GPConfig, 3> gp;
     std::array<uadl::MPCConfig, 3> mpc;
     std::array<Eigen::Vector2d, 3> physical_input_limits;
 
-    // Residual budget of Theorem 2 and Eq. (44), per axis, SI units.
+    // Residual budget of Assumption 4, Theorem 2 and Eq. (46), per axis, SI units.
     struct ResidualBounds {
-        double rkhs_norm = 0.72;              // B for the learned prior (A, B, D)
-        double rkhs_norm_nominal = 0.95;      // B for f0=0, g0=1 (C)
-        double disturbance = 0.25;            // d
-        double measurement = 0.10;            // IMU label error
-        double state_error = 0.03;            // e_x
-        double synchronization = 0.02;        // e_sync
-        double command_modification = 0.10;  // c: gain floor, saturation, mapping
-        double hold_error = 0.05;             // intersample/reference discretization
-        double lipschitz_f = 0.8;
-        double lipschitz_g = 0.1;
-        double prior_abs_f = 2.0;
-        double prior_min_g = 0.5;
-        double prior_max_g = 2.0;
-        double reference_acceleration = 1.5;
-        double min_envelope = 0.5;
-        double max_envelope = 1.85;
-        double fixed_envelope = 1.5;          // configuration B
+        double rkhs_norm = 0.36;              // B of Assumption 4
+        double disturbance = 0.25;            // d_bar
+        double measurement = 0.10;            // eps_bar, IMU label error
+        double state_error = 0.03;            // e_bar_x
+        double synchronization = 0.02;        // e_bar_sync
+        double command_modification = 0.10;   // c_bar: gain floor, saturation, mapping
+        double hold_error = 0.05;             // hold and reference discretization (enter w_k)
+        double lipschitz_f = 0.8;             // L_f
+        double lipschitz_g = 0.1;             // L_g
+        double reference_acceleration = 1.5;  // allowed reference acceleration
+        double min_envelope = 0.5;            // admissible tube scaling
+        double max_envelope = 1.20;
     };
     std::array<ResidualBounds, 3> bounds;
+    // Analysis domain X of Assumption 1, also the hard safety limits of
+    // Remark 8: [p_x, p_y, p_z, v_x, v_y, v_z].
     uadl::State analysis_lower;
     uadl::State analysis_upper;
+    // Gain floor g_on of the protected inverse, Eq. (28).
     double gain_floor = 0.5;
-    double predicted_input_radius = 1.0;
     double sensor_max_skew = 0.02;
     double input_delay = 0.0;
     double command_max_age = 0.03;
+    // Result-acceptance cutoff from the scheduled cycle release, shared by
+    // the three axis solves, and the command deadline.
     double solver_cutoff = 0.0085;
     double control_deadline = 0.01;
 
@@ -105,11 +103,7 @@ private:
     template <typename TName, typename TVal>
     void read_essential_param(const ros::NodeHandle &nh, const TName &name, TVal &val)
     {
-        if (nh.getParam(name, val))
-        {
-            // pass
-        }
-        else
+        if (!nh.getParam(name, val))
         {
             ROS_ERROR_STREAM("Read param: " << name << " failed.");
             ROS_BREAK();

@@ -40,42 +40,41 @@ msg_timeout:   # s
     bat:  0.5
 
 controller:
-  # A: GAN prior + LMPC; B: GAN prior + fixed-envelope tube MPC;
-  # C: nominal prior (f0=0, g0=1) + online GP + adaptive tube MPC;
-  # D: GAN prior + online GP + adaptive tube MPC (proposed method).
-  method: D
-  solver_cutoff: 0.0085      # s from cycle start, shared by the three axes
+  # Offline GAN prior + online task-error GP + uncertainty-aware tube MPC.
+  solver_cutoff: 0.0085      # s from the scheduled cycle release, shared by the three axes
   deadline: 0.010            # s; late commands are discarded
 
 prior:
   # TorchScript priors exported by utils/offline_GANs_Train.py, mapping
-  # float32[N,6] = [px,py,pz,vx,vy,vz] to (f0[N,1], g0[N,1]). run_ctrl.launch
-  # sets these paths to $(find px4ctrl)/models/generator_prior_{X,Y,Z}.pt.
-  model_x: ""
-  model_y: ""
-  model_z: ""
+  # float32[N,6] = [px,py,pz,vx,vy,vz] to (f0[N,1], g0[N,1]) of Eq. (15).
+  # run_ctrl.launch sets these paths to $(find px4ctrl)/models/generator_prior_{X,Y,Z}.pt.
+  model_x: "generator_prior_X.pt"
+  model_y: "generator_prior_Y.pt"
+  model_z: "generator_prior_Z.pt"
 
 online_gp:
+  # Hyperparameters are selected offline and fixed during flight.
   l: 0.5                     # SE lengthscale on the 6-D state
-  variance_a: 1.0            # signal variance of k_a
-  variance_b: 1.0            # signal variance of k_b
-  noise_variance: 0.01       # working likelihood Sigma_e = sigma_on^2 I
-  N_max: 50                  # retained observations per axis
+  variance_a: 1.0            # signal variance s_ker^2 of k_a
+  variance_b: 1.0            # signal variance s_ker^2 of k_b
+  noise_variance: 0.01       # working likelihood Sigma_e = sigma_on^2 I, Eq. (21)
+  N_max: 50                  # retained valid observations per axis
   minimum_sample_interval: 0.01  # s, insertion rate up to 100 Hz
-  gain_floor: 0.5            # protected inverse denominator
-  predicted_input_radius: 1.0  # m/s^2, input range around the last command over the horizon
+  gain_floor: 0.5            # g_on of the protected inverse, Eq. (28)
   max_sensor_skew: 0.02      # s, odometry/IMU stamp alignment
   input_delay: 0.0           # s, command-to-response delay
-  command_max_age: 0.03      # s, oldest command paired with a label
+  command_max_age: 0.03      # s, oldest executed command paired with a label
 
 rtmpc:
-  dt: 0.01                   # s, same period as the controller
-  H: 20
-  tube_contraction: 0.999    # lambda in A_K Z0 (+) W0 <= lambda Z0
-  max_tube_faces: 64
-  slack_linear_weight: 1000.0
+  dt: 0.01                   # s, sampling period T_s
+  H: 20                      # horizon
+  # Base set Z0 of the homothetic tube, Eq. (47): finite sum of s terms of
+  # A_K^j W0 with A_K^s W0 <= alpha W0.
+  tube_terms: 500            # s
+  tube_alpha: 1.0e-4         # alpha
+  tube_contraction: 0.999    # lambda in A_K Z0 (+) W0 <= lambda Z0 (Remark 8(i))
+  slack_linear_weight: 1000.0      # soft tracking constraints, Eq. (54)
   slack_quadratic_weight: 10000.0
-  state_estimation_radius: 0.0  # m, tube containment radius of the estimator error
   xy:
     Q_p: 10.0
     Q_v: 1.0
@@ -104,19 +103,24 @@ rtmpc:
     correction_max: 5.0
 
 bounds:
-  # Analysis domain X (Assumption 1), [px, py, pz, vx, vy, vz]: 10 x 10 m arena.
+  # Explicit implementation design inputs for the paper's assumptions.
+  # They are not experiment results or measured certificates. The controller
+  # checks invariance/feasibility with these values and rejects incompatible
+  # budgets instead of clipping them to force a feasible controller.
+  # Analysis domain X (Assumption 1) and hard safety limits (Remark 8),
+  # [px, py, pz, vx, vy, vz]: 10 x 10 m arena.
   state_lower: [-5.0, -5.0, -0.5, -3.0, -3.0, -2.0]
   state_upper: [ 5.0,  5.0,  3.5,  3.0,  3.0,  2.0]
-  # Residual budget of Theorem 2 and Eq. (44), m/s^2 unless noted.
-  #   rkhs_norm / rkhs_norm_nominal: B for the GAN prior (A, B, D) / nominal prior (C)
+  # Residual budget of Assumption 4, Theorem 2 and Eq. (46), m/s^2 unless noted.
+  #   rkhs_norm: RKHS norm bound B of the task errors a, b (Eq. 39)
   #   disturbance d, measurement eps, state_error e_x (m, m/s), synchronization,
-  #   command_modification c, hold_error, lipschitz_f/g (1/s),
-  #   prior_abs_f, prior_min_g, prior_max_g: envelope of the frozen prior,
-  #   reference_acceleration: feed-forward limit,
-  #   min/max_envelope: admissible tube scaling, fixed_envelope: configuration B.
+  #   command_modification c, hold_error (hold and reference discretization),
+  #   lipschitz_f/g (1/s), reference_acceleration: allowed reference acceleration,
+  #   min/max_envelope: admissible scaling of the homothetic tube (Eq. 47).
+  # state_error also bounds each component of the state-information box;
+  # tube propagation accounts for every subsequent consistent estimator update.
   x:
-    rkhs_norm: 0.72
-    rkhs_norm_nominal: 0.95
+    rkhs_norm: 0.36
     disturbance: 0.25
     measurement: 0.10
     state_error: 0.03
@@ -125,16 +129,11 @@ bounds:
     hold_error: 0.05
     lipschitz_f: 0.8
     lipschitz_g: 0.1
-    prior_abs_f: 2.0
-    prior_min_g: 0.5
-    prior_max_g: 2.0
     reference_acceleration: 1.5
     min_envelope: 0.5
-    max_envelope: 1.85
-    fixed_envelope: 1.5
+    max_envelope: 1.20
   y:
-    rkhs_norm: 0.72
-    rkhs_norm_nominal: 0.95
+    rkhs_norm: 0.36
     disturbance: 0.25
     measurement: 0.10
     state_error: 0.03
@@ -143,16 +142,11 @@ bounds:
     hold_error: 0.05
     lipschitz_f: 0.8
     lipschitz_g: 0.1
-    prior_abs_f: 2.0
-    prior_min_g: 0.5
-    prior_max_g: 2.0
     reference_acceleration: 1.5
     min_envelope: 0.5
-    max_envelope: 1.85
-    fixed_envelope: 1.5
+    max_envelope: 1.20
   z:
-    rkhs_norm: 0.40
-    rkhs_norm_nominal: 0.60
+    rkhs_norm: 0.30
     disturbance: 0.20
     measurement: 0.08
     state_error: 0.03
@@ -161,10 +155,6 @@ bounds:
     hold_error: 0.04
     lipschitz_f: 0.8
     lipschitz_g: 0.1
-    prior_abs_f: 2.0
-    prior_min_g: 0.5
-    prior_max_g: 2.0
     reference_acceleration: 0.5
     min_envelope: 0.4
-    max_envelope: 1.45
-    fixed_envelope: 1.2
+    max_envelope: 0.95

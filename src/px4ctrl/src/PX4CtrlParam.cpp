@@ -9,16 +9,14 @@ Parameter_t::ResidualBounds defaultBounds(int axis)
 {
     Parameter_t::ResidualBounds b;
     if (axis == 2) {
-        b.rkhs_norm = 0.40;
-        b.rkhs_norm_nominal = 0.60;
+        b.rkhs_norm = 0.30;
         b.disturbance = 0.20;
         b.measurement = 0.08;
         b.command_modification = 0.08;
         b.hold_error = 0.04;
         b.reference_acceleration = 0.5;
         b.min_envelope = 0.4;
-        b.max_envelope = 1.45;
-        b.fixed_envelope = 1.2;
+        b.max_envelope = 0.95;
     }
     return b;
 }
@@ -60,16 +58,15 @@ void Parameter_t::config_from_ros_handle(const ros::NodeHandle &nh)
     read_essential_param(nh, "thrust_model/accurate_thrust_model", thr_map.accurate_thrust_model);
     read_essential_param(nh, "thrust_model/hover_percentage", thr_map.hover_percentage);
 
-    nh.param<std::string>("controller/method", method, "D");
     nh.param("controller/solver_cutoff", solver_cutoff, 0.0085);
     nh.param("controller/deadline", control_deadline, 0.01);
     nh.param("online_gp/gain_floor", gain_floor, 0.5);
-    nh.param("online_gp/predicted_input_radius", predicted_input_radius, 1.0);
     nh.param("online_gp/max_sensor_skew", sensor_max_skew, 0.02);
     nh.param("online_gp/input_delay", input_delay, 0.0);
     nh.param("online_gp/command_max_age", command_max_age, 0.03);
 
-    // Analysis domain X of Assumption 1: [p_x, p_y, p_z, v_x, v_y, v_z].
+    // Analysis domain X of Assumption 1 and hard safety limits of Remark 8:
+    // [p_x, p_y, p_z, v_x, v_y, v_z].
     const std::vector<double> default_lower{-5.0, -5.0, -0.5, -3.0, -3.0, -2.0};
     const std::vector<double> default_upper{5.0, 5.0, 3.5, 3.0, 3.0, 2.0};
     std::vector<double> lower, upper;
@@ -105,11 +102,11 @@ void Parameter_t::config_from_ros_handle(const ros::NodeHandle &nh)
 
         nh.param("rtmpc/dt", m.dt, 0.01);
         nh.param("rtmpc/H", m.horizon, 20);
+        nh.param("rtmpc/tube_terms", m.tube_terms, 500);
+        nh.param("rtmpc/tube_alpha", m.tube_alpha, 1.0e-4);
         nh.param("rtmpc/tube_contraction", m.tube_contraction, 0.999);
-        nh.param("rtmpc/max_tube_faces", m.max_tube_faces, 64);
         nh.param("rtmpc/slack_linear_weight", m.slack_linear_weight, 1.0e3);
         nh.param("rtmpc/slack_quadratic_weight", m.slack_quadratic_weight, 1.0e4);
-        nh.param("rtmpc/state_estimation_radius", m.state_estimation_bound, 0.0);
         nh.param(prefix + "Q_p", m.Q_diag(0), vertical ? 15.0 : 10.0);
         nh.param(prefix + "Q_v", m.Q_diag(1), vertical ? 2.0 : 1.0);
         nh.param(prefix + "R", m.R, vertical ? 0.5 : 0.1);
@@ -125,7 +122,6 @@ void Parameter_t::config_from_ros_handle(const ros::NodeHandle &nh)
 
         const std::string bp = "bounds/" + axes[i] + "/";
         nh.param(bp + "rkhs_norm", b.rkhs_norm, d.rkhs_norm);
-        nh.param(bp + "rkhs_norm_nominal", b.rkhs_norm_nominal, d.rkhs_norm_nominal);
         nh.param(bp + "disturbance", b.disturbance, d.disturbance);
         nh.param(bp + "measurement", b.measurement, d.measurement);
         nh.param(bp + "state_error", b.state_error, d.state_error);
@@ -134,25 +130,16 @@ void Parameter_t::config_from_ros_handle(const ros::NodeHandle &nh)
         nh.param(bp + "hold_error", b.hold_error, d.hold_error);
         nh.param(bp + "lipschitz_f", b.lipschitz_f, d.lipschitz_f);
         nh.param(bp + "lipschitz_g", b.lipschitz_g, d.lipschitz_g);
-        nh.param(bp + "prior_abs_f", b.prior_abs_f, d.prior_abs_f);
-        nh.param(bp + "prior_min_g", b.prior_min_g, d.prior_min_g);
-        nh.param(bp + "prior_max_g", b.prior_max_g, d.prior_max_g);
         nh.param(bp + "reference_acceleration", b.reference_acceleration, d.reference_acceleration);
         nh.param(bp + "min_envelope", b.min_envelope, d.min_envelope);
         nh.param(bp + "max_envelope", b.max_envelope, d.max_envelope);
-        nh.param(bp + "fixed_envelope", b.fixed_envelope, d.fixed_envelope);
         nh.param<std::string>("prior/model_" + axes[i], prior_paths[i], "");
 
-        // Configuration C uses the nominal net-acceleration prior f0=0, g0=1.
-        if (method == "C") {
-            b.prior_abs_f = 0.0;
-            b.prior_min_g = b.prior_max_g = 1.0;
-        }
-        g.rkhs_bound = method == "C" ? b.rkhs_norm_nominal : b.rkhs_norm;
-        // Configuration A is the nominal LMPC baseline without a tube.
-        m.max_envelope = method == "A" ? 0.0 : b.max_envelope;
-        m.min_envelope = method == "A" ? 0.0 : b.min_envelope;
-        if (method == "A") m.state_estimation_bound = 0.0;
+        // Adaptive homothetic tube sized by Eq. (46) with the RKHS bound B.
+        g.rkhs_bound = b.rkhs_norm;
+        m.max_envelope = b.max_envelope;
+        m.min_envelope = b.min_envelope;
+        m.max_estimation_error.setConstant(b.state_error);
     }
 
     max_angle /= (180.0 / M_PI);

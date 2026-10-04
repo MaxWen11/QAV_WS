@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <utility>
 
@@ -10,6 +11,8 @@ namespace {
 
 bool finite(double value) { return std::isfinite(value); }
 
+// Remark 3: the frozen prior is accepted only for finite values with a raw
+// gain g0 = 1/Theta2 >= 1e-6; failures are rejected, never clipped.
 bool validPrior(double f0, double g0) {
     return finite(f0) && finite(g0) && g0 >= 1e-6;
 }
@@ -23,11 +26,63 @@ bool nonnegativeVariance(double& value, double scale) {
     return true;
 }
 
-// For 0 <= k_j <= variance, |sum c_j*k_j| is bounded by variance
-// times the greater of the positive and negative coefficient sums.
-double positiveKernelWeightBound(const Eigen::VectorXd& coefficients) {
-    return std::max(coefficients.cwiseMax(0.0).sum(),
-                    -coefficients.cwiseMin(0.0).sum());
+struct Interval {
+    double lower;
+    double upper;
+};
+
+double down(double value) {
+    return std::nextafter(value, -std::numeric_limits<double>::infinity());
+}
+
+double up(double value) {
+    return std::nextafter(value, std::numeric_limits<double>::infinity());
+}
+
+bool validInterval(const Interval& value) {
+    return finite(value.lower) && finite(value.upper) && value.lower <= value.upper;
+}
+
+Interval add(const Interval& lhs, const Interval& rhs) {
+    return {down(lhs.lower + rhs.lower), up(lhs.upper + rhs.upper)};
+}
+
+Interval scale(const Interval& value, double coefficient) {
+    if (coefficient >= 0.0)
+        return {down(coefficient * value.lower), up(coefficient * value.upper)};
+    return {down(coefficient * value.upper), up(coefficient * value.lower)};
+}
+
+Interval multiply(const Interval& lhs, const Interval& rhs) {
+    const double products[] = {lhs.lower * rhs.lower, lhs.lower * rhs.upper,
+                               lhs.upper * rhs.lower, lhs.upper * rhs.upper};
+    return {down(*std::min_element(std::begin(products), std::end(products))),
+            up(*std::max_element(std::begin(products), std::end(products)))};
+}
+
+double maxAbs(const Interval& value) {
+    return std::max(std::abs(value.lower), std::abs(value.upper));
+}
+
+// The SE kernel is monotone in squared distance. Distances to a box attain
+// their minima by coordinate projection and their maxima at farthest corners.
+Interval kernelOnBox(const State& location, const GPStateRegion& region,
+                     double lengthscale) {
+    double squared_min = 0.0, squared_max = 0.0;
+    for (int axis = 0; axis < 6; ++axis) {
+        const Interval difference{down(location(axis) - region.state_upper(axis)),
+                                  up(location(axis) - region.state_lower(axis))};
+        double nearest = 0.0;
+        if (difference.lower > 0.0) nearest = difference.lower;
+        else if (difference.upper < 0.0) nearest = -difference.upper;
+        const double farthest = maxAbs(difference);
+        const double normalized_min = std::max(0.0, down(nearest / lengthscale));
+        const double normalized_max = up(farthest / lengthscale);
+        squared_min = std::max(0.0, down(squared_min + down(normalized_min * normalized_min)));
+        squared_max = up(squared_max + up(normalized_max * normalized_max));
+    }
+    return {std::max(0.0, down(std::exp(down(-0.5 * squared_max)))),
+            std::min(1.0, up(std::exp(up(-0.5 * squared_min))))};
 }
 
 }  // namespace
@@ -56,6 +111,9 @@ GPResponse GPPrediction::response(double u) const {
         result.status = GPStatus::InvalidObservation;
         return result;
     }
+    // Eq. (26): h0 + q_hat = f_hat + u g_hat and
+    // sigma_q^2 = sigma_a^2 + 2 h0 c_ab + h0^2 sigma_b^2
+    //           = sigma_f^2 + 2 u c_fg + u^2 sigma_g^2.
     const double h0 = f0_ + g0_ * u;
     result.mean = f + g * u;
     result.variance = var_a + 2.0 * h0 * cov_ab + h0 * h0 * var_b;
@@ -68,6 +126,7 @@ GPResponse GPPrediction::response(double u) const {
     }
     result.sigma = std::sqrt(result.variance);
     if (errors_.size() > 0) {
+        // w = K_ab^{-1} k_q with k_q = k_a + h0 H0 k_b (Theorem 2).
         const Eigen::VectorXd weights = weights_a_ + h0 * weights_b_;
         if (!weights.allFinite()) {
             result.status = GPStatus::NumericalFailure;
@@ -75,6 +134,7 @@ GPResponse GPPrediction::response(double u) const {
         }
         result.historical_error = weights.cwiseAbs().dot(errors_);
     }
+    // Eq. (40): E_q = B sigma_q + sum_j |w_j| e_bar_j.
     result.error_bound = rkhs_bound_ * result.sigma + result.historical_error;
     if (!finite(result.error_bound)) {
         result.status = GPStatus::NumericalFailure;
@@ -97,6 +157,8 @@ OnlineGP::OnlineGP(const GPConfig& config) : config_(config) {
         config_.max_samples > 0;
 }
 
+// Unit squared-exponential kernel; k_a and k_b scale it by their signal
+// variances.
 double OnlineGP::baseKernel(const State& lhs, const State& rhs) const {
     return std::exp(-0.5 * ((lhs - rhs) / config_.lengthscale).squaredNorm());
 }
@@ -134,8 +196,10 @@ GPPrediction OnlineGP::predict(const State& state, double f0, double g0) const {
         result.weights_a_ = factor_.solve(ka);
         result.weights_b_ = factor_.solve(h0_kb);
         if (!result.weights_a_.allFinite() || !result.weights_b_.allFinite()) return result;
+        // Eq. (22): a_hat = k_a' K_ab^{-1} r, b_hat = k_b' H0' K_ab^{-1} r.
         result.a = ka.dot(alpha_);
         result.b = h0_kb.dot(alpha_);
+        // Eq. (24): latent posterior variances and cross-covariance.
         result.var_a -= ka.dot(result.weights_a_);
         result.var_b -= h0_kb.dot(result.weights_b_);
         result.cov_ab = -ka.dot(result.weights_b_);
@@ -150,10 +214,13 @@ GPPrediction OnlineGP::predict(const State& state, double f0, double g0) const {
     if (std::abs(result.cov_ab) > max_cov + cov_tolerance) return result;
     result.cov_ab = std::max(-max_cov, std::min(max_cov, result.cov_ab));
 
+    // Eq. (23): f_hat = f0 + a_hat + f0 b_hat, g_hat = g0 (1 + b_hat).
     result.f = f0 + result.a + f0 * result.b;
     // Keep the raw finite posterior gain, including zero or negative values.
-    // The protected inverse belongs to the controller, not GP conditioning.
+    // The protected inverse of Eq. (28) belongs to the controller, not GP
+    // conditioning.
     result.g = g0 * (1.0 + result.b);
+    // Eq. (25) and the posterior cross-covariance c_fg.
     result.var_f = result.var_a + 2.0 * f0 * result.cov_ab + f0 * f0 * result.var_b;
     result.var_g = g0 * g0 * result.var_b;
     result.cov_fg = g0 * result.cov_ab + f0 * g0 * result.var_b;
@@ -172,6 +239,7 @@ GPResponse OnlineGP::response(const State& state, double f0, double g0, double u
 }
 
 bool OnlineGP::rebuild() {
+    // Eqs. (18)-(21): r = H - h0, K_ab = K_a + H0 K_b H0' + Sigma_e.
     const Eigen::Index count = static_cast<Eigen::Index>(samples_.size());
     Eigen::MatrixXd gram(count, count);
     Eigen::VectorXd residual(count);
@@ -197,21 +265,7 @@ bool OnlineGP::rebuild() {
     factor_.compute(gram);
     if (factor_.info() != Eigen::Success) return false;
     alpha_ = factor_.solve(residual);
-    if (!alpha_.allFinite()) return false;
-
-    global_error_a_ = 0.0;
-    global_error_b_ = 0.0;
-    for (Eigen::Index i = 0; i < count; ++i) {
-        if (errors_(i) == 0.0) continue;
-        // Symmetry makes this solved column the i-th row of the precision
-        // operator. No explicit inverse is formed or used for prediction.
-        const Eigen::VectorXd row = factor_.solve(Eigen::VectorXd::Unit(count, i));
-        if (!row.allFinite()) return false;
-        global_error_a_ += errors_(i) * config_.variance_a * positiveKernelWeightBound(row);
-        global_error_b_ += errors_(i) * config_.variance_b *
-            positiveKernelWeightBound(row.cwiseProduct(h0_));
-    }
-    return finite(global_error_a_) && finite(global_error_b_);
+    return alpha_.allFinite();
 }
 
 GPInsertResult OnlineGP::insert(const GPSample& sample) {
@@ -278,125 +332,11 @@ GPInsertResult OnlineGP::insert(const GPSample& sample) {
     return result;
 }
 
-GPGlobalBound OnlineGP::globalBound(double abs_f0_bound, double abs_g0_bound,
-                                   double abs_u) const {
-    GPGlobalBound result;
-    if (!config_valid_) {
-        result.status = GPStatus::InvalidConfiguration;
-        return result;
-    }
-    if (!finite(abs_f0_bound) || !finite(abs_g0_bound) || !finite(abs_u) ||
-        abs_f0_bound < 0.0 || abs_g0_bound < 0.0 || abs_u < 0.0) {
-        result.status = GPStatus::InvalidPrior;
-        return result;
-    }
-    const double h0_bound = abs_f0_bound + abs_g0_bound * abs_u;
-    // Conditioning cannot increase latent variance; this prior bound is
-    // uniform for the supplied prior/input envelope, including unseen states.
-    const double variance_bound = config_.variance_a + h0_bound * h0_bound * config_.variance_b;
-    result.sigma_bound = std::sqrt(variance_bound);
-    result.historical_error = global_error_a_ + h0_bound * global_error_b_;
-    result.error_bound = config_.rkhs_bound * result.sigma_bound + result.historical_error;
-    if (!finite(h0_bound) || !finite(result.error_bound)) return result;
-    result.valid = true;
-    result.status = GPStatus::Ok;
-    return result;
-}
-
-GPGlobalBound OnlineGP::domainBound(const State& lower, const State& upper,
-                                   double abs_f0_bound, double abs_g0_bound,
-                                   double abs_u, std::size_t max_cells) const {
-    GPGlobalBound bound = globalBound(abs_f0_bound, abs_g0_bound, abs_u);
-    if (!bound.valid) return bound;
-    if (!lower.allFinite() || !upper.allFinite() || (lower.array() > upper.array()).any()) {
-        bound.valid = false;
-        bound.status = GPStatus::InvalidState;
-        return bound;
-    }
-    if (max_cells == 0 || max_cells > 256) {
-        bound.valid = false;
-        bound.status = GPStatus::InvalidConfiguration;
-        return bound;
-    }
-    if (samples_.empty()) return bound; // Exactly the prior bound, no artificial inflation.
-
-    struct Cell { State lower; State upper; };
-    std::vector<Cell> cells;
-    cells.reserve(max_cells);
-    cells.push_back({lower, upper});
-    // A scalar SE lengthscale makes longest physical and normalized dimensions
-    // identical. Bisect the widest remaining cell; the children cover it fully.
-    while (cells.size() < max_cells) {
-        std::size_t selected = 0;
-        Eigen::Index dimension = 0;
-        double longest = 0.0;
-        for (std::size_t i = 0; i < cells.size(); ++i) {
-            const State width = cells[i].upper - cells[i].lower;
-            if (!width.allFinite()) return bound;
-            Eigen::Index candidate_dimension;
-            const double candidate_width = width.maxCoeff(&candidate_dimension);
-            if (candidate_width > longest) {
-                longest = candidate_width;
-                selected = i;
-                dimension = candidate_dimension;
-            }
-        }
-        if (longest <= 0.0) break;
-        const double middle = cells[selected].lower(dimension) + 0.5 * longest;
-        if (middle <= cells[selected].lower(dimension) || middle >= cells[selected].upper(dimension)) break;
-        Cell right = cells[selected];
-        cells[selected].upper(dimension) = middle;
-        right.lower(dimension) = middle;
-        cells.push_back(std::move(right));
-    }
-
-    const double h_max = abs_f0_bound + abs_g0_bound * abs_u;
-    const double prior_variance = config_.variance_a + h_max * h_max * config_.variance_b;
-    GPGlobalBound covered;
-    covered.status = GPStatus::Ok;
-    for (const Cell& cell : cells) {
-        const State width = cell.upper - cell.lower;
-        const State center = cell.lower + 0.5 * width;
-        const double radius = 0.5 * width.norm();
-        if (!center.allFinite() || !finite(radius)) return bound;
-        const double normalized_radius = radius / config_.lengthscale;
-        const double feature_distance = std::sqrt(2.0 * prior_variance *
-            -std::expm1(-0.5 * normalized_radius * normalized_radius));
-        // ||grad exp(-||x-x_i||^2/(2l^2))|| <= 1/(l*sqrt(e)).
-        // The cached positive/negative coefficient envelope is >= half its
-        // L1 norm, hence 2*global_error_{a,b} bounds the weight Lipschitz sums.
-        const double kernel_difference = std::min(1.0, normalized_radius / std::sqrt(std::exp(1.0)));
-        const double history_increase = 2.0 * kernel_difference *
-            (global_error_a_ + h_max * global_error_b_);
-
-        // The query prior (0,1) is used solely to parameterize h0=u here.
-        // Covariance and historical weights depend on query h0, not its
-        // separate f0/g0 values. At fixed x the norm + weighted absolute
-        // affine function is convex in h0, so interval endpoints suffice.
-        const auto prediction = predict(center, 0.0, 1.0);
-        if (!prediction.valid) return bound;
-        for (double h : {-h_max, h_max}) {
-            const auto at_center = prediction.response(h);
-            if (!at_center.valid) return bound;
-            const double sigma = at_center.sigma + feature_distance;
-            const double history = at_center.historical_error + history_increase;
-            const double error = config_.rkhs_bound * sigma + history;
-            if (!finite(error) || !finite(sigma) || !finite(history)) return bound;
-            covered.sigma_bound = std::max(covered.sigma_bound, sigma);
-            covered.historical_error = std::max(covered.historical_error, history);
-            covered.error_bound = std::max(covered.error_bound, error);
-        }
-    }
-    covered.valid = true;
-    // Both certificates hold uniformly, so their minimum is also a certificate.
-    return covered.error_bound < bound.error_bound ? covered : bound;
-}
-
-GPGlobalBound OnlineGP::predictedSetBound(const std::vector<State>& states,
-                                          const std::vector<double>& f0,
-                                          const std::vector<double>& g0,
-                                          double u_min, double u_max) const {
-    GPGlobalBound result;
+GPSetBound OnlineGP::predictedSetBound(const std::vector<State>& states,
+                                       const std::vector<double>& f0,
+                                       const std::vector<double>& g0,
+                                       double u_min, double u_max) const {
+    GPSetBound result;
     if (!config_valid_) {
         result.status = GPStatus::InvalidConfiguration;
         return result;
@@ -413,6 +353,15 @@ GPGlobalBound OnlineGP::predictedSetBound(const std::vector<State>& states,
             result.status = prediction.status;
             return result;
         }
+        if (i == 0) {
+            result.f_lower = result.f_upper = prediction.f;
+            result.g_lower = result.g_upper = prediction.g;
+        } else {
+            result.f_lower = std::min(result.f_lower, prediction.f);
+            result.f_upper = std::max(result.f_upper, prediction.f);
+            result.g_lower = std::min(result.g_lower, prediction.g);
+            result.g_upper = std::max(result.g_upper, prediction.g);
+        }
         for (double u : {u_min, u_max}) {
             const GPResponse response = prediction.response(u);
             if (!response.valid) {
@@ -428,26 +377,99 @@ GPGlobalBound OnlineGP::predictedSetBound(const std::vector<State>& states,
     return result;
 }
 
-GPModelBounds OnlineGP::modelBounds(double abs_f0_bound, double g0_min,
-                                   double g0_max) const {
-    GPModelBounds result;
+GPSetBound OnlineGP::predictedRegionBound(const GPStateRegion& region,
+                                         double u_min, double u_max) const {
+    GPSetBound result;
     if (!config_valid_) {
         result.status = GPStatus::InvalidConfiguration;
         return result;
     }
-    if (!finite(abs_f0_bound) || !finite(g0_min) || !finite(g0_max) ||
-        abs_f0_bound < 0.0 || g0_min < 1e-6 || g0_max < g0_min) {
+    if (!region.state_lower.allFinite() || !region.state_upper.allFinite() ||
+        (region.state_lower.array() > region.state_upper.array()).any() ||
+        !finite(u_min) || !finite(u_max) || u_min > u_max) {
+        result.status = GPStatus::InvalidState;
+        return result;
+    }
+    const Interval f0{region.f0_lower, region.f0_upper};
+    const Interval g0{region.g0_lower, region.g0_upper};
+    if (!validInterval(f0) || !validInterval(g0) || g0.lower < 1e-6) {
         result.status = GPStatus::InvalidPrior;
         return result;
     }
-    const double abs_a = config_.variance_a * alpha_.cwiseAbs().sum();
-    const double abs_b = config_.variance_b * h0_.cwiseProduct(alpha_).cwiseAbs().sum();
-    result.abs_f = abs_f0_bound * (1.0 + abs_b) + abs_a;
-    const double products[] = {g0_min * (1.0 - abs_b), g0_min * (1.0 + abs_b),
-                               g0_max * (1.0 - abs_b), g0_max * (1.0 + abs_b)};
-    result.g_min = *std::min_element(products, products + 4);
-    result.g_max = *std::max_element(products, products + 4);
-    if (!finite(result.abs_f) || !finite(result.g_min) || !finite(result.g_max)) return result;
+
+    const Eigen::Index count = static_cast<Eigen::Index>(samples_.size());
+    std::vector<Interval> kernels(static_cast<std::size_t>(count));
+    Interval a{0.0, 0.0}, b{0.0, 0.0};
+    for (Eigen::Index i = 0; i < count; ++i) {
+        kernels[static_cast<std::size_t>(i)] =
+            kernelOnBox(samples_[static_cast<std::size_t>(i)].state, region, config_.lengthscale);
+        const Interval& kernel = kernels[static_cast<std::size_t>(i)];
+        a = add(a, scale(scale(kernel, config_.variance_a), alpha_(i)));
+        b = add(b, scale(scale(scale(kernel, config_.variance_b), h0_(i)), alpha_(i)));
+    }
+    // Posterior mean enclosure in the policy-error coordinates, including the
+    // dependence of both f and g on b. No online gain floor enters these maps.
+    const Interval one_plus_b = add({1.0, 1.0}, b);
+    const Interval f = add(a, multiply(f0, one_plus_b));
+    const Interval g = multiply(g0, one_plus_b);
+    if (!validInterval(f) || !validInterval(g)) return result;
+    result.f_lower = f.lower;
+    result.f_upper = f.upper;
+    result.g_lower = g.lower;
+    result.g_upper = g.upper;
+
+    Eigen::MatrixXd lower;
+    if (count > 0) lower = factor_.matrixL();
+    // For each fixed x, E_q(x,u) is a sum of norms of affine functions of u:
+    // B sqrt([1,h0] Cov(a,b) [1,h0]') + ||diag(e_bar) w||_1.
+    // It is convex in u, hence bounding both endpoints covers every input.
+    for (double u : {u_min, u_max}) {
+        const Interval h = add(f0, scale(g0, u));
+        if (!validInterval(h)) return result;
+        const double h_abs = maxAbs(h);
+        const double prior_variance = up(config_.variance_a +
+            up(config_.variance_b * up(h_abs * h_abs)));
+        std::vector<Interval> whitened(static_cast<std::size_t>(count));
+        std::vector<Interval> weights(static_cast<std::size_t>(count));
+        double reduction_lower = 0.0;
+        for (Eigen::Index i = 0; i < count; ++i) {
+            // k_q,i = SE(x_i,x) [s_a^2 + h0_i s_b^2 h0(x,u)].
+            const Interval coefficient = add({config_.variance_a, config_.variance_a},
+                scale(scale(h, config_.variance_b), h0_(i)));
+            Interval value = multiply(kernels[static_cast<std::size_t>(i)], coefficient);
+            // Interval forward solve z = L^-1 k_q. Lower-bound ||z||^2
+            // without subtracting an invalid sampled posterior variance.
+            for (Eigen::Index j = 0; j < i; ++j)
+                value = add(value, scale(whitened[static_cast<std::size_t>(j)], -lower(i, j)));
+            if (!finite(lower(i, i)) || lower(i, i) <= 0.0) return result;
+            const double diagonal = lower(i, i);
+            value = {down(value.lower / diagonal), up(value.upper / diagonal)};
+            if (!validInterval(value)) return result;
+            whitened[static_cast<std::size_t>(i)] = value;
+            const double nearest = value.lower > 0.0 ? value.lower :
+                (value.upper < 0.0 ? -value.upper : 0.0);
+            reduction_lower = std::max(0.0, down(reduction_lower + down(nearest * nearest)));
+        }
+        double historical_upper = 0.0;
+        for (Eigen::Index i = count; i-- > 0;) {
+            // Interval backward solve w = L^-T z = K_ab^-1 k_q.
+            Interval value = whitened[static_cast<std::size_t>(i)];
+            for (Eigen::Index j = i + 1; j < count; ++j)
+                value = add(value, scale(weights[static_cast<std::size_t>(j)], -lower(j, i)));
+            value = {down(value.lower / lower(i, i)), up(value.upper / lower(i, i))};
+            if (!validInterval(value)) return result;
+            weights[static_cast<std::size_t>(i)] = value;
+            historical_upper = up(historical_upper + up(maxAbs(value) * errors_(i)));
+        }
+        double variance_upper = up(prior_variance - reduction_lower);
+        if (!nonnegativeVariance(variance_upper, prior_variance)) return result;
+        const double sigma_upper = up(std::sqrt(variance_upper));
+        const double error_upper = up(up(config_.rkhs_bound * sigma_upper) + historical_upper);
+        if (!finite(error_upper)) return result;
+        result.sigma_bound = std::max(result.sigma_bound, sigma_upper);
+        result.historical_error = std::max(result.historical_error, historical_upper);
+        result.error_bound = std::max(result.error_bound, error_upper);
+    }
     result.valid = true;
     result.status = GPStatus::Ok;
     return result;
@@ -459,8 +481,6 @@ void OnlineGP::reset() {
     h0_.resize(0);
     alpha_.resize(0);
     errors_.resize(0);
-    global_error_a_ = 0.0;
-    global_error_b_ = 0.0;
 }
 
 }  // namespace uadl

@@ -1,10 +1,9 @@
 #include "controller.h"
+#include <ATen/Parallel.h>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
-#ifdef UADL_WITH_TORCH
-#include <ATen/Parallel.h>
-#endif
+#include <thread>
 
 namespace {
 // Tolerated offset between MAVROS source stamps and the local ROS clock.
@@ -27,16 +26,12 @@ Controller::Controller(Parameter_t& parameters) : param(parameters) {
 }
 
 bool Controller::configure() {
-    if (param.method != "A" && param.method != "B" && param.method != "C" && param.method != "D") {
-        status_ = "controller/method must be A, B, C or D"; return false;
-    }
     if (!param.analysis_lower.allFinite() || !param.analysis_upper.allFinite() ||
         !(param.analysis_lower.array() < param.analysis_upper.array()).all()) {
         status_ = "bounds/state_lower must lie below bounds/state_upper"; return false;
     }
     if (!std::isfinite(param.ctrl_freq_max) || std::abs(param.ctrl_freq_max - 100.0) > 1e-6 ||
         !std::isfinite(param.gain_floor) || param.gain_floor <= 0.0 ||
-        !nonnegative(param.predicted_input_radius) ||
         !nonnegative(param.sensor_max_skew) || !nonnegative(param.input_delay) ||
         !std::isfinite(param.command_max_age) || param.command_max_age <= 0.0 ||
         !std::isfinite(param.solver_cutoff) || param.solver_cutoff <= 0.0 ||
@@ -59,13 +54,10 @@ bool Controller::configure() {
     }
     for (int axis = 0; axis < 3; ++axis) {
         const auto& b = param.bounds[axis];
-        const double required[] = {b.rkhs_norm, b.rkhs_norm_nominal, b.disturbance, b.measurement,
-            b.state_error, b.synchronization, b.command_modification, b.hold_error, b.lipschitz_f,
-            b.lipschitz_g, b.prior_abs_f, b.reference_acceleration, b.max_envelope,
-            b.min_envelope, b.fixed_envelope};
-        if (!std::all_of(std::begin(required), std::end(required), nonnegative) ||
-            !std::isfinite(b.prior_min_g) || b.prior_min_g < 1e-6 ||
-            !std::isfinite(b.prior_max_g) || b.prior_max_g < b.prior_min_g) {
+        const double required[] = {b.rkhs_norm, b.disturbance, b.measurement, b.state_error,
+            b.synchronization, b.command_modification, b.hold_error, b.lipschitz_f, b.lipschitz_g,
+            b.reference_acceleration, b.max_envelope, b.min_envelope};
+        if (!std::all_of(std::begin(required), std::end(required), nonnegative)) {
             status_ = std::string("residual budget on axis ") + kAxisNames[axis] +
                       " must be finite and nonnegative";
             return false;
@@ -94,26 +86,43 @@ bool Controller::configure() {
             status_ = "physical input box exceeds the thrust/tilt range of the thrust model"; return false;
         }
     }
-    if (param.method != "C") {
-#ifdef UADL_WITH_TORCH
-        try {
-            at::set_num_threads(1);
-            torch::NoGradGuard no_grad;
-            for (int i = 0; i < 3; ++i) {
-                if (param.prior_paths[i].empty()) throw std::runtime_error("prior/model_" + std::string(kAxisNames[i]) + " is empty");
-                prior_models_[i] = torch::jit::load(param.prior_paths[i], torch::kCPU);
-                prior_models_[i].eval();
-                auto tuple = prior_models_[i].forward({torch::zeros({1, 6}, torch::kFloat32)}).toTuple();
-                if (tuple->elements().size() != 2 ||
-                    tuple->elements()[0].toTensor().numel() != 1 || tuple->elements()[1].toTensor().numel() != 1)
-                    throw std::runtime_error("prior must map float32[N,6] to (f0[N,1], g0[N,1])");
+    try {
+        at::set_num_threads(1);
+        torch::NoGradGuard no_grad;
+        for (int i = 0; i < 3; ++i) {
+            if (param.prior_paths[i].empty()) throw std::runtime_error("prior/model_" + std::string(kAxisNames[i]) + " is empty");
+            prior_models_[i] = torch::jit::load(param.prior_paths[i], torch::kCPU);
+            prior_models_[i].eval();
+            auto tuple = prior_models_[i].forward({torch::zeros({1, 6}, torch::kFloat32)}).toTuple();
+            if (tuple->elements().size() != 2 ||
+                tuple->elements()[0].toTensor().numel() != 1 || tuple->elements()[1].toTensor().numel() != 1)
+                throw std::runtime_error("prior must map float32[N,6] to (f0[N,1], g0[N,1])");
+            // Frozen network interval propagation covers the entire analysis
+            // domain, including every predicted state and sampling interval.
+            auto lower = torch::empty({6}, torch::kFloat64);
+            auto upper = torch::empty({6}, torch::kFloat64);
+            for (int j = 0; j < 6; ++j) {
+                lower.data_ptr<double>()[j] = param.analysis_lower(j);
+                upper.data_ptr<double>()[j] = param.analysis_upper(j);
             }
-        } catch (const std::exception& error) {
-            status_ = std::string("offline prior load failed: ") + error.what(); return false;
+            const auto interval = prior_models_[i].get_method("interval_bounds")({lower, upper}).toTuple();
+            if (interval->elements().size() != 4)
+                throw std::runtime_error("prior interval_bounds must return f0 lower/upper, g0 lower/upper");
+            auto& region = prior_regions_[i];
+            region.state_lower = param.analysis_lower;
+            region.state_upper = param.analysis_upper;
+            region.f0_lower = interval->elements()[0].toTensor().item<double>();
+            region.f0_upper = interval->elements()[1].toTensor().item<double>();
+            region.g0_lower = interval->elements()[2].toTensor().item<double>();
+            region.g0_upper = interval->elements()[3].toTensor().item<double>();
+            if (!std::isfinite(region.f0_lower) || !std::isfinite(region.f0_upper) ||
+                !std::isfinite(region.g0_lower) || !std::isfinite(region.g0_upper) ||
+                region.f0_lower > region.f0_upper || region.g0_lower < 1e-6 ||
+                region.g0_lower > region.g0_upper)
+                throw std::runtime_error("offline prior has no valid positive-gain interval on the analysis domain");
         }
-#else
-        status_ = "configurations A, B and D use the offline prior; build with UADL_ENABLE_TORCH=ON"; return false;
-#endif
+    } catch (const std::exception& error) {
+        status_ = std::string("offline prior load failed: ") + error.what(); return false;
     }
     status_ = "ready";
     return true;
@@ -125,43 +134,37 @@ bool Controller::priors(const std::vector<uadl::State>& states,
     g0.assign(states.size(), Eigen::Vector3d::Ones());
     for (const auto& state : states)
         if (!state.allFinite()) return false;
-    if (param.method != "C") {
-#ifdef UADL_WITH_TORCH
-        try {
-            torch::NoGradGuard no_grad;
-            const auto count = static_cast<int64_t>(states.size());
-            auto input = torch::empty({count, 6}, torch::kFloat32);
-            float* data = input.data_ptr<float>();
-            for (int64_t k = 0; k < count; ++k)
-                for (int j = 0; j < 6; ++j) data[k * 6 + j] = static_cast<float>(states[k](j));
-            for (int i = 0; i < 3; ++i) {
-                auto result = prior_models_[i].forward({input}).toTuple();
-                if (result->elements().size() != 2) return false;
-                const auto f = result->elements()[0].toTensor().to(torch::kFloat64).contiguous().view({-1});
-                const auto g = result->elements()[1].toTensor().to(torch::kFloat64).contiguous().view({-1});
-                if (f.numel() != count || g.numel() != count) return false;
-                const auto fa = f.accessor<double, 1>();
-                const auto ga = g.accessor<double, 1>();
-                for (int64_t k = 0; k < count; ++k) {
-                    f0[k](i) = fa[k];
-                    g0[k](i) = ga[k];
-                }
-            }
-        } catch (const std::exception& error) {
-            status_ = std::string("offline prior inference failed: ") + error.what(); return false;
-        }
-#else
-        return false;
-#endif
-    }
-    // The prior envelope of Remark 3: f0 and g0 are kept inside the declared
-    // bounds used by the residual budget; g0 stays strictly positive.
-    for (std::size_t k = 0; k < states.size(); ++k) {
-        if (!f0[k].allFinite() || !g0[k].allFinite()) return false;
+    // Frozen generative prior of Eq. (15), f0 = -Theta1/Theta2, g0 = 1/Theta2.
+    try {
+        torch::NoGradGuard no_grad;
+        const auto count = static_cast<int64_t>(states.size());
+        auto input = torch::empty({count, 6}, torch::kFloat32);
+        float* data = input.data_ptr<float>();
+        for (int64_t k = 0; k < count; ++k)
+            for (int j = 0; j < 6; ++j) data[k * 6 + j] = static_cast<float>(states[k](j));
         for (int i = 0; i < 3; ++i) {
-            const auto& b = param.bounds[i];
-            f0[k](i) = std::max(-b.prior_abs_f, std::min(b.prior_abs_f, f0[k](i)));
-            g0[k](i) = std::max(b.prior_min_g, std::min(b.prior_max_g, g0[k](i)));
+            auto result = prior_models_[i].forward({input}).toTuple();
+            if (result->elements().size() != 2) return false;
+            const auto f = result->elements()[0].toTensor().to(torch::kFloat64).contiguous().view({-1});
+            const auto g = result->elements()[1].toTensor().to(torch::kFloat64).contiguous().view({-1});
+            if (f.numel() != count || g.numel() != count) return false;
+            const auto fa = f.accessor<double, 1>();
+            const auto ga = g.accessor<double, 1>();
+            for (int64_t k = 0; k < count; ++k) {
+                f0[k](i) = fa[k];
+                g0[k](i) = ga[k];
+            }
+        }
+    } catch (const std::exception& error) {
+        status_ = std::string("offline prior inference failed: ") + error.what(); return false;
+    }
+    // Remark 3: the prior is used as evaluated. Nonfinite values or raw gains
+    // g0 < 1e-6 are rejected, never clipped; the protected gain of Eq. (28)
+    // applies only to the control denominator.
+    for (std::size_t k = 0; k < states.size(); ++k) {
+        if (!f0[k].allFinite() || !g0[k].allFinite() || (g0[k].array() < 1e-6).any()) {
+            status_ = "offline prior rejected: nonfinite value or raw gain below 1e-6";
+            return false;
         }
     }
     return true;
@@ -181,65 +184,79 @@ bool Controller::insideDomain(const uadl::State& state) const {
 }
 
 double Controller::historicalError(int axis, double input) const {
-    // Per-sample observation error of Assumption 4.
+    // Per-sample observation-error bound of Assumption 4:
+    // e_bar_j = d_bar + eps_bar + (L_f + |u_j| L_g) e_bar_x + e_bar_sync.
     const auto& b = param.bounds[axis];
     return b.disturbance + b.measurement + b.synchronization +
         (b.lipschitz_f + std::abs(input) * b.lipschitz_g) * b.state_error;
 }
 
-double Controller::residualMargin(int axis) const {
-    // Non-GP terms of Eq. (44): c + d + (Lf + u_bar*Lg)*e_x, plus hold error.
+double Controller::residualMargin(int axis, double command_bound, double reference_hold_bound) const {
+    // Non-GP terms of Eq. (46): c_bar + d_bar + (L_f + u_bar L_g) e_bar_x,
+    // where u_bar bounds the executed input, plus the acceleration-level
+    // bound of the hold and reference-discretization errors that enter w_k
+    // (Section V, Eq. 49).
     const auto& b = param.bounds[axis];
     const double max_u = param.physical_input_limits[axis].cwiseAbs().maxCoeff();
-    return b.command_modification + b.disturbance +
-           (b.lipschitz_f + max_u * b.lipschitz_g) * b.state_error + b.hold_error;
+    const double ancillary_error = accepted_.mpc[axis].ancillary_gain().cwiseAbs().sum() * b.state_error;
+    return command_bound + b.disturbance +
+           (b.lipschitz_f + max_u * b.lipschitz_g) * b.state_error +
+           b.hold_error + reference_hold_bound + ancillary_error;
 }
 
-Eigen::Vector3d Controller::lastExecutedInput() const {
-    return history_.empty() ? Eigen::Vector3d::Zero() : history_.back().input;
-}
-
-std::vector<uadl::State> Controller::predictedStates(const uadl::State& state,
-                                                     const Desired_State_t& ref) const {
-    // Reference continuation over the horizon, shifted by the current error.
-    const double horizon = param.mpc[0].dt * param.mpc[0].horizon;
-    std::vector<uadl::State> points{state};
-    for (double tau : {0.5 * horizon, horizon}) {
-        uadl::State point = state;
-        for (int i = 0; i < 3; ++i) {
-            point(i) = state(i) + tau * ref.v(i) + 0.5 * tau * tau * ref.a(i);
-            point(i + 3) = state(i + 3) + tau * ref.a(i);
-        }
-        points.push_back(point);
+uadl::SafetyLimits Controller::safetyLimits(int axis, const uadl::ReferenceContinuation& path,
+                                           double stamp) const {
+    // Hard safety limits (Remark 8) on the analysis domain X of Assumption 1,
+    // evaluated along the reference continuation at the H+2 instants used
+    // by the plan and its shifted continuation.
+    uadl::SafetyLimits limits;
+    const double dt = param.mpc[axis].dt;
+    for (int i = 0; i <= param.mpc[axis].horizon + 1; ++i) {
+        const auto sample = path.sample(stamp + i * dt);
+        limits.reference.emplace_back(sample.p(axis), sample.v(axis));
     }
-    return points;
+    limits.lower << param.analysis_lower(axis), param.analysis_lower(axis + 3);
+    limits.upper << param.analysis_upper(axis), param.analysis_upper(axis + 3);
+    limits.estimation_error.setConstant(param.bounds[axis].state_error);
+    // Intersample reachability: |a| <= sup|v| + sup|x''_ref| + zeta_bar.
+    // Shrink the sampling-state box by the maximum one-period excursion.
+    const double acceleration = param.mpc[axis].correction_domain.cwiseAbs().maxCoeff() +
+        param.bounds[axis].reference_acceleration + param.bounds[axis].max_envelope;
+    const double velocity = std::max(std::abs(limits.lower(1)), std::abs(limits.upper(1)));
+    const Eigen::Vector2d excursion(velocity * dt + 0.5 * acceleration * dt * dt,
+                                    acceleration * dt);
+    limits.lower += excursion;
+    limits.upper -= excursion;
+    const auto tail = path.bounds(stamp + param.mpc[axis].horizon * dt);
+    limits.have_tail_bounds = tail.valid;
+    limits.tail_reference_lower << tail.lower(axis), tail.lower(axis + 3);
+    limits.tail_reference_upper << tail.upper(axis), tail.upper(axis + 3);
+    return limits;
 }
 
-bool Controller::targetEnvelopes(const Context& context, const Desired_State_t& ref,
-                                 const uadl::State& state, Eigen::Vector3d& targets) {
+bool Controller::targetEnvelopes(const Context& context, Eigen::Vector3d& targets,
+        std::array<Eigen::Vector2d, 3>& correction_domains,
+        Eigen::Vector3d& command_bounds, const Eigen::Vector3d& reference_hold_bounds) const {
+    // Full analysis-domain enclosure, not an extremum of a few samples.
+    // It also covers intersample states admitted by safetyLimits().
     targets.setZero();
-    if (param.method == "A") return true;
-    if (param.method == "B") {
-        for (int i = 0; i < 3; ++i) targets(i) = param.bounds[i].fixed_envelope;
-        return true;
-    }
-    // Eq. (44) with E_q from Eq. (34) over the predicted state-input set.
-    const auto points = predictedStates(state, ref);
-    std::vector<Eigen::Vector3d> f0, g0;
-    if (!priors(points, f0, g0)) return false;
-    const Eigen::Vector3d last_input = lastExecutedInput();
     for (int i = 0; i < 3; ++i) {
-        std::vector<double> f(points.size()), g(points.size());
-        for (std::size_t k = 0; k < points.size(); ++k) {
-            f[k] = f0[k](i);
-            g[k] = g0[k](i);
-        }
         const auto& limits = param.physical_input_limits[i];
-        const double u_min = std::max(limits(0), std::min(limits(1), last_input(i) - param.predicted_input_radius));
-        const double u_max = std::min(limits(1), std::max(limits(0), last_input(i) + param.predicted_input_radius));
-        const auto bound = context.gp[i].predictedSetBound(points, f, g, u_min, u_max);
+        const auto bound = context.gp[i].predictedRegionBound(prior_regions_[i], limits(0), limits(1));
         if (!bound.valid) return false;
-        targets(i) = bound.error_bound + residualMargin(i);
+        const double protected_lower = std::max(param.gain_floor, bound.g_lower);
+        const double reference_acceleration = param.bounds[i].reference_acceleration;
+        // A common V whose protected inverse stays in the physical input
+        // box for every state and every admitted reference acceleration.
+        correction_domains[i](0) = std::max(param.mpc[i].correction_domain(0),
+            bound.f_upper + protected_lower * limits(0) + reference_acceleration);
+        correction_domains[i](1) = std::min(param.mpc[i].correction_domain(1),
+            bound.f_lower + protected_lower * limits(1) - reference_acceleration);
+        if (correction_domains[i](0) >= 0.0 || correction_domains[i](1) <= 0.0)
+            return false;
+        command_bounds(i) = std::max(param.bounds[i].command_modification,
+            std::max(0.0, param.gain_floor - bound.g_lower) * limits.cwiseAbs().maxCoeff());
+        targets(i) = bound.error_bound + residualMargin(i, command_bounds(i), reference_hold_bounds(i));
     }
     return true;
 }
@@ -247,72 +264,158 @@ bool Controller::targetEnvelopes(const Context& context, const Desired_State_t& 
 Controller::Evaluation Controller::evaluate(Context& context, const Desired_State_t& ref,
         const uadl::State& state, const Eigen::Vector3d& f0, const Eigen::Vector3d& g0,
         double voltage, double stamp, const Clock::time_point& cutoff, bool backup_only) {
-    Evaluation result;
+    Evaluation prepared;
     if (!state.allFinite() || !ref.p.allFinite() || !ref.v.allFinite() ||
         !ref.a.allFinite() || !std::isfinite(ref.yaw)) {
-        result.status = "nonfinite state or reference"; return result;
+        prepared.status = "nonfinite state or reference"; return prepared;
     }
-    result.inside_domain = insideDomain(state);
-    Eigen::Vector3d targets;
-    if (!targetEnvelopes(context, ref, state, targets)) {
-        result.status = "residual envelope evaluation failed"; return result;
+    prepared.inside_domain = insideDomain(state);
+    if (!prepared.inside_domain) {
+        prepared.status = "state outside the analysis domain"; return prepared;
     }
-    Eigen::Vector3d input;
     for (int i = 0; i < 3; ++i) {
-        const auto& b = param.bounds[i];
-        auto& post = result.posterior[i];
-        post = context.gp[i].predict(state, f0(i), g0(i));
-        if (!post.valid) {
-            result.status = std::string("GP posterior on axis ") + kAxisNames[i] + ": " +
-                            uadl::gpStatusName(post.status);
-            return result;
+        if (std::abs(ref.a(i)) > param.bounds[i].reference_acceleration) {
+            prepared.status = "reference acceleration outside the admitted range"; return prepared;
         }
-        // Homothetic scaling of Eq. (45) under the tube transition of Remark 8.
-        double envelope = targets(i);
-        if (param.method != "A") {
-            envelope = std::max({envelope, context.mpc[i].min_next_envelope(), param.mpc[i].min_envelope});
-            if (envelope > param.mpc[i].max_envelope) {
-                envelope = param.mpc[i].max_envelope;
-                result.envelope_saturated = true;
+    }
+    if (param.thr_map.accurate_thrust_model && (!std::isfinite(voltage) || voltage < param.low_voltage)) {
+        prepared.status = "battery voltage outside the thrust-model domain"; return prepared;
+    }
+    Eigen::Vector3d targets, command_bounds;
+    Eigen::Vector3d acceleration_limits;
+    for (int i = 0; i < 3; ++i) acceleration_limits(i) = param.bounds[i].reference_acceleration;
+    const auto path = backup_only ? context.reference_path :
+        uadl::ReferenceContinuation::create(ref.p, ref.v, ref.a, ref.yaw, stamp, acceleration_limits);
+    if (!path.valid) {
+        prepared.status = "reference has no admissible terminal continuation"; return prepared;
+    }
+    if (!path.sample(stamp).valid) {
+        prepared.status = "reference timestamp precedes its committed origin"; return prepared;
+    }
+    std::array<Eigen::Vector2d, 3> correction_domains, errors;
+    std::array<uadl::SafetyLimits, 3> safety;
+    if (!targetEnvelopes(context, targets, correction_domains, command_bounds,
+                         path.accelerationChangeBound(param.mpc[0].dt))) {
+        prepared.status = "invalid uniform residual bound or empty inverse-admissible correction set";
+        return prepared;
+    }
+    for (int i = 0; i < 3; ++i) {
+        prepared.posterior[i] = context.gp[i].predict(state, f0(i), g0(i));
+        if (!prepared.posterior[i].valid) {
+            prepared.status = std::string("invalid GP posterior on axis ") + kAxisNames[i];
+            return prepared;
+        }
+        prepared.envelopes(i) = std::max({targets(i), context.mpc[i].min_next_envelope(),
+                                           param.mpc[i].min_envelope});
+        if (prepared.envelopes(i) > param.mpc[i].max_envelope + 1e-12) {
+            prepared.envelope_exceeded = true;
+            prepared.status = std::string("residual envelope exceeds the terminal design bound on axis ") + kAxisNames[i];
+            return prepared;
+        }
+        errors[i] << state(i) - ref.p(i), state(i + 3) - ref.v(i);
+        safety[i] = safetyLimits(i, path, stamp);
+    }
+    // Copy every solve input, including the model, tube and reference version.
+    // The worker owns no reference to Controller, ROS inputs or accepted_.
+    auto job = std::make_shared<SolveJob>();
+    job->context = context;
+    job->evaluation = prepared;
+    const auto thrust_config = thrust_config_;
+    const auto physical_limits = param.physical_input_limits;
+    const double gain_floor = param.gain_floor;
+    auto solve = [job, errors, safety, correction_domains, command_bounds, ref, path,
+                  thrust_config, physical_limits, gain_floor, voltage, stamp, cutoff, backup_only]() {
+        auto& result = job->evaluation;
+        auto& snapshot = job->context;
+        try {
+            Eigen::Vector3d input;
+            bool admissible = true;
+            for (int i = 0; i < 3; ++i) {
+                const double budget = backup_only ? 0.0 :
+                    std::max(0.0, std::chrono::duration<double>(cutoff - Clock::now()).count()) / (3 - i);
+                result.mpc[i] = snapshot.mpc[i].solve(errors[i], result.envelopes(i),
+                                                     correction_domains[i], safety[i], budget);
+                if (!result.mpc[i].valid) {
+                    result.status = std::string("MPC on axis ") + kAxisNames[i] + ": " + result.mpc[i].status;
+                    admissible = false; break;
+                }
+                result.used_backup = result.used_backup || result.mpc[i].used_backup;
+                result.eta(i) = result.mpc[i].correction + ref.a(i);
+                input(i) = (result.eta(i) - result.posterior[i].f) /
+                           std::max(gain_floor, result.posterior[i].g);
+            }
+            if (admissible) {
+                result.mapped = uadl::mapAcceleration(input, ref.yaw, voltage, thrust_config, physical_limits);
+                admissible = result.mapped.valid;
+                if (!admissible) result.status = "attitude/thrust mapping failed";
+            }
+            for (int i = 0; i < 3 && admissible; ++i) {
+                // Check the actually mapped command, using raw posterior g.
+                const double u_ex = result.mapped.executed_input(i);
+                const auto response = result.posterior[i].response(u_ex);
+                const double c = result.posterior[i].f + result.posterior[i].g * u_ex - result.eta(i);
+                admissible = response.valid && std::isfinite(c) &&
+                    std::abs(c) <= command_bounds(i) + 1e-9 &&
+                    u_ex >= physical_limits[i](0) - 1e-9 && u_ex <= physical_limits[i](1) + 1e-9;
+                if (!admissible) result.status = "executed command violates its residual or physical-input bound";
+            }
+            if (admissible) {
+                snapshot.reference_path = path;
+                snapshot.have_reference = true;
+                result.valid = true;
+                result.status = result.used_backup ? "backup" : "normal";
+            }
+        } catch (const std::exception& error) {
+            result.valid = false;
+            result.status = std::string("solve failed: ") + error.what();
+        } catch (...) {
+            result.valid = false;
+            result.status = "solve failed with an unknown exception";
+        }
+        {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            job->finished = Clock::now();
+            job->done = true;
+        }
+        job->completed.notify_one();
+    };
+    if (backup_only) {
+        // budget=0 shifts the retained plan and never invokes the QP solver.
+        solve();
+    } else {
+        if (solve_job_) {
+            std::lock_guard<std::mutex> lock(solve_job_->mutex);
+            if (!solve_job_->done) {
+                prepared.status = "previous QP worker is overdue; use the maintained backup";
+                return prepared;
             }
         }
-        result.envelopes(i) = envelope;
-        const double budget = backup_only ? 0.0 :
-            std::max(0.0, std::chrono::duration<double>(cutoff - Clock::now()).count()) / (3 - i);
-        const Eigen::Vector2d error(state(i) - ref.p(i), state(i + 3) - ref.v(i));
-        result.mpc[i] = context.mpc[i].solve(error, envelope, param.mpc[i].correction_domain, budget);
-        if (!result.mpc[i].valid) {
-            result.status = std::string("MPC on axis ") + kAxisNames[i] + ": " + result.mpc[i].status;
-            return result;
+        if (Clock::now() >= cutoff) {
+            prepared.status = "solver cutoff reached before launch"; return prepared;
         }
-        result.used_backup = result.used_backup || result.mpc[i].used_backup;
-        // eta = v + reference acceleration, followed by the protected inverse.
-        const double feedforward = std::max(-b.reference_acceleration,
-                                            std::min(b.reference_acceleration, ref.a(i)));
-        result.eta(i) = result.mpc[i].correction + feedforward;
-        input(i) = (result.eta(i) - post.f) / std::max(param.gain_floor, post.g);
+        solve_job_ = job;
+        std::thread(std::move(solve)).detach();
+        std::unique_lock<std::mutex> lock(job->mutex);
+        if (!job->completed.wait_until(lock, cutoff, [&job] { return job->done; }) ||
+            job->finished > cutoff) {
+            prepared.status = "solver cutoff; late worker result discarded";
+            return prepared;
+        }
     }
-    if (param.thr_map.accurate_thrust_model && (!std::isfinite(voltage) || voltage <= 0.0)) {
-        result.status = "battery voltage unavailable for the thrust model"; return result;
-    }
-    result.mapped = uadl::mapAcceleration(input, ref.yaw, voltage, thrust_config_, param.physical_input_limits);
-    if (!result.mapped.valid) { result.status = "attitude/thrust mapping failed"; return result; }
-    context.reference = ref;
-    context.reference_stamp = stamp;
-    context.have_reference = true;
-    result.valid = true;
-    result.status = result.used_backup ? "backup" : "normal";
-    if (result.envelope_saturated) result.status += "; envelope held at max_envelope";
-    return result;
+    if (job->evaluation.valid) context = std::move(job->context);
+    return job->evaluation;
 }
 
 Desired_State_t Controller::continuedReference(double stamp) const {
-    Desired_State_t ref = accepted_.reference;
-    const double dt = std::max(0.0, stamp - accepted_.reference_stamp);
-    ref.p += dt * ref.v + 0.5 * dt * dt * ref.a;
-    ref.v += dt * ref.a;
+    // Follow the committed path through its stationary terminal tail.
+    // Repeated backup cycles never restart the braking continuation.
+    const auto sample = accepted_.reference_path.sample(stamp);
+    Desired_State_t ref;
+    ref.p = sample.p;
+    ref.v = sample.v;
+    ref.a = sample.a;
+    ref.yaw = sample.yaw;
     ref.j.setZero();
-    // The backup retains its reference acceleration and yaw (Remark 10).
     return ref;
 }
 
@@ -324,6 +427,7 @@ quadrotor_msgs::Px4ctrlDebug Controller::update(const Desired_State_t& des,
     cycle_announced_ = false;
     active_cycle_ = active;
     pending_.reset();
+    // Result-acceptance cutoff, measured from the scheduled release.
     const auto cutoff = started + std::chrono::duration_cast<Clock::duration>(
         std::chrono::duration<double>(param.solver_cutoff));
     const double now = ros::Time::now().toSec();
@@ -357,22 +461,24 @@ quadrotor_msgs::Px4ctrlDebug Controller::update(const Desired_State_t& des,
         now - stamp > param.msg_timeout.odom || now - imu_stamp > param.msg_timeout.imu) {
         status_ = "stale or invalid odometry/IMU"; return debug;
     }
-    // Response label: IMU specific force rotated by the odometry attitude,
-    // plus the gravity vector (Section VI-C).
+    // Online GP response label (Section VI-C): the IMU specific force rotated
+    // into the inertial frame, plus the gravity vector -g e3.
     const auto observed = uadl::specificForceToNetAcceleration(imu.a, odom.q, param.gra);
     Eigen::Vector3d f0, g0;
-    if (!observed.allFinite() || !priors(state, f0, g0)) {
-        status_ = "nonfinite acceleration label or prior output"; return debug;
+    const bool observation_valid = observed.allFinite();
+    if (!priors(state, f0, g0)) {
+        status_ = "rejected prior"; return debug;
     }
     Context candidate = accepted_;
     bool inserted = false;
     bool sample_rejected = false;
-    // A new sample needs an advancing state timestamp and a synchronized IMU
-    // label. It is paired with the command published before the measurement
-    // (plus the configured actuation delay), never with the current action.
-    if (learning && (param.method == "C" || param.method == "D") &&
-        stamp >= sample_epoch_ && imu_stamp >= sample_epoch_ && stamp > last_sample_stamp_ + 1e-9 &&
-        std::abs(stamp - imu_stamp) <= param.sensor_max_skew) {
+    // A sample is new and valid for insertion when its state timestamp
+    // advances (Section VI-C), at up to 100 Hz. It requires a synchronized
+    // IMU label and is paired with the command executed before the
+    // measurement (plus the configured actuation delay), never with the
+    // current action.
+    if (learning && observation_valid && stamp >= sample_epoch_ && imu_stamp >= sample_epoch_ &&
+        stamp > last_sample_stamp_ + 1e-9 && std::abs(stamp - imu_stamp) <= param.sensor_max_skew) {
         last_sample_stamp_ = stamp;
         const ExecutedCommand* executed = nullptr;
         for (auto it = history_.rbegin(); it != history_.rend(); ++it)
@@ -388,17 +494,11 @@ quadrotor_msgs::Px4ctrlDebug Controller::update(const Desired_State_t& des,
                 sample.g0 = g0(i);
                 sample.timestamp = stamp;
                 sample.error_bound = historicalError(i, sample.u_ex);
-                // Pre-insertion residual gate against the retained posterior.
+                // Pre-insertion residual check against the retained posterior.
                 accepted = candidate.gp[i].insert(sample).accepted;
             }
-            if (accepted) {
-                // The updated model must keep the predicted-set envelope within
-                // the common terminal domain (Remark 8).
-                Eigen::Vector3d targets;
-                accepted = targetEnvelopes(candidate, des, state, targets);
-                for (int i = 0; i < 3 && accepted; ++i)
-                    accepted = param.method == "A" || targets(i) <= param.mpc[i].max_envelope;
-            }
+            // The candidate remains provisional until evaluate() checks the
+            // full-domain bound, changed input set and shifted backup plan.
             if (accepted) {
                 inserted = true;
             } else {
@@ -407,7 +507,7 @@ quadrotor_msgs::Px4ctrlDebug Controller::update(const Desired_State_t& des,
             }
         }
     }
-    // Remark 10: prepare the feasible continuation with the retained model and
+    // Remark 8: prepare the feasible continuation with the retained model and
     // a compatible reference before spending the remaining solver budget.
     Context backup = accepted_;
     Evaluation backup_result;
@@ -461,6 +561,7 @@ void Controller::resetOnline() {
     for (auto& gp : accepted_.gp) gp.reset();
     for (auto& mpc : accepted_.mpc) mpc.reset();
     accepted_.have_reference = false;
+    accepted_.reference_path = uadl::ReferenceContinuation();
     pending_.reset();
     history_.clear();
     last_sample_stamp_ = 0.0;
@@ -516,6 +617,7 @@ void Controller::populateDebug(const Desired_State_t& ref, const Odom_Data_t& od
     debug.real_x = odom.p.x(); debug.real_y = odom.p.y(); debug.real_z = odom.p.z();
     debug.real_vx = odom.v.x(); debug.real_vy = odom.v.y(); debug.real_vz = odom.v.z();
     debug.fb_a_x = observation.x(); debug.fb_a_y = observation.y(); debug.fb_a_z = observation.z();
+    debug.response_label_valid = observation.allFinite();
     debug.des_a_x = eval.mapped.executed_input.x();
     debug.des_a_y = eval.mapped.executed_input.y();
     debug.des_a_z = eval.mapped.executed_input.z();
@@ -525,7 +627,7 @@ void Controller::populateDebug(const Desired_State_t& ref, const Odom_Data_t& od
     debug.voltage = voltage; debug.controller_valid = output.valid;
     debug.used_backup = output.used_backup; debug.cycle_ms = elapsed_ms;
     debug.online_status = status_;
-    debug.envelope_saturated = eval.envelope_saturated;
+    debug.envelope_exceeded = eval.envelope_exceeded;
     debug.inside_analysis_domain = eval.inside_domain;
     for (int i = 0; i < 3; ++i) {
         const auto response = eval.posterior[i].response(eval.mapped.executed_input(i));
@@ -534,6 +636,7 @@ void Controller::populateDebug(const Desired_State_t& ref, const Odom_Data_t& od
         debug.gp_cov_fg[i] = eval.posterior[i].cov_fg;
         debug.response_sigma[i] = response.sigma; debug.response_error_bound[i] = response.error_bound;
         debug.residual_envelope[i] = eval.envelopes(i);
+        // c_k = f_hat + g_hat u_ex - eta of Theorem 2(2), with the raw gain.
         debug.command_error[i] = eval.posterior[i].f + eval.posterior[i].g * eval.mapped.executed_input(i) - eval.eta(i);
         debug.nominal_position_error[i] = eval.mpc[i].nominal_state(0);
         debug.tube_position_radius[i] = eval.mpc[i].tube_radii(0);

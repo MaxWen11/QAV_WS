@@ -74,8 +74,7 @@ if(NOT mvIMPACT_LIBRARY OR NOT EXISTS ${mvIMPACT_LIBRARY})
         "Could not find mvimpact library, set mvIMPACT_LIBRARY "
         "to full path to mvimpact library direcotory.${mvIMPACT_CHECK_LIBRARY_DIRS}~~")
 else()
-    # TODO: need to fix this hacky solution for getting mvIMPACT_LIBRARY_DIR
-    string(REGEX MATCH ".*/" mvIMPACT_LIBRARY_DIR ${mvIMPACT_LIBRARY})
+    get_filename_component(mvIMPACT_LIBRARY_DIR "${mvIMPACT_LIBRARY}" DIRECTORY)
     message(STATUS "mvimpact library dir found: " ${mvIMPACT_LIBRARY_DIR})
 
 endif()
@@ -83,17 +82,6 @@ endif()
 # Mark internally as found, then verify. mvIMPACT_REPORT_NOT_FOUND() unsets if
 # called.
 set(mvIMPACT_FOUND TRUE)
-
-# Extract mvimpact version
-if(mvIMPACT_LIBRARY_DIR)
-    file(GLOB mvIMPACT_LIBS
-        RELATIVE ${mvIMPACT_LIBRARY_DIR}
-        ${mvIMPACT_LIBRARY_DIR}/libmvBlueFOX.so.[0-9].[0-9].[0-9])
-    # TODO: add version support
-    # string(REGEX MATCH ""
-    #       mvIMPACT_WORLD_VERSION ${mvIMPACT_PVBASE})
-    # message(STATUS "mvimpact world version: " ${mvIMPACT_WORLD_VERSION})
-endif()
 
 # Catch case when caller has set mvIMPACT_INCLUDE_DIR in the cache / GUI and
 # thus FIND_[PATH/LIBRARY] are not called, but specified locations are

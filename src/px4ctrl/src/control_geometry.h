@@ -19,11 +19,16 @@ struct MappedCommand {
     Eigen::Vector3d executed_input = Eigen::Vector3d::Zero();
     double thrust = 0.0;
 };
-// u is net inertial acceleration. executed_input is reconstructed from the
-// final attitude and thrust command, after ALL clipping/mapping operations.
+// u is the commanded net inertial acceleration after gravity compensation
+// (Eq. 56). The collective thrust and reference attitude satisfy
+// F_T,cmd R_cmd e3 = m0 (u + g e3). executed_input is reconstructed from the
+// final attitude and thrust command after ALL clipping/mapping operations,
+// u = (F_T,cmd/m0) R_cmd e3 - g e3 (Section VI-B).
 MappedCommand mapAcceleration(const Eigen::Vector3d& u, double yaw,
                               double voltage, const ThrustConfig& config,
                               const std::array<Eigen::Vector2d, 3>& limits);
+// Response label: the IMU specific force rotated into the inertial frame
+// plus the gravity vector -g e3 (Section VI-C).
 Eigen::Vector3d specificForceToNetAcceleration(const Eigen::Vector3d& force,
                                               const Eigen::Quaterniond& body_to_world,
                                               double gravity);

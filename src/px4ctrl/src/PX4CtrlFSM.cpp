@@ -83,8 +83,8 @@ void PX4CtrlFSM::return_to_manual(const std::string& reason) {
     ROS_WARN("[px4ctrl] Returning to MANUAL_CTRL: %s", reason.c_str());
 }
 
-void PX4CtrlFSM::process() {
-    controller.beginCycle(std::chrono::steady_clock::now());
+void PX4CtrlFSM::process(std::chrono::steady_clock::time_point scheduled_release) {
+    controller.beginCycle(scheduled_release);
     const ros::Time now = ros::Time::now();
     const bool enter_hover = rc_data.enter_hover_mode;
     const bool enter_command = rc_data.enter_command_mode;

@@ -46,7 +46,7 @@ public:
     ros::Time last_set_hover_pose_time;
     enum State_t { MANUAL_CTRL = 1, AUTO_HOVER, CMD_CTRL, AUTO_TAKEOFF, AUTO_LAND };
     PX4CtrlFSM(Parameter_t&, Controller&);
-    void process();
+    void process(std::chrono::steady_clock::time_point scheduled_release);
     bool reset_online(std_srvs::Trigger::Request&, std_srvs::Trigger::Response&);
     bool rc_is_received(const ros::Time&) const;
     bool cmd_is_received(const ros::Time&) const;

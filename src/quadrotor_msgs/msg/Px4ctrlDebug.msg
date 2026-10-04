@@ -59,12 +59,15 @@ float64 real_vz
 
 # UADL online diagnostics. des_a_* is the executed net inertial acceleration
 # reconstructed from the final attitude/thrust command; fb_a_* is the measured
-# net inertial acceleration (IMU specific force rotated into the world frame).
+# net inertial acceleration (IMU specific force rotated into the inertial
+# frame plus the gravity vector -g e3).
 bool controller_valid
+bool response_label_valid
 bool used_backup
 bool gp_sample_inserted
 bool gp_sample_rejected
-bool envelope_saturated
+# Residual envelope above max_envelope: the tightened MPC has no admissible tube.
+bool envelope_exceeded
 bool inside_analysis_domain
 string online_status
 float64 cycle_ms

@@ -1,0 +1,13 @@
+{
+  "exchange_directory": "data/physical_fd_exchange",
+  "namespace": "/drone1",
+  "timeout_seconds": 3600.0,
+  "state_tolerance": [0.02, 0.02, 0.02, 0.03, 0.03, 0.03],
+  "action_tolerance": 0.00001,
+  "max_sensor_skew": 0.01,
+  "max_response_delay": 0.03,
+  "max_probe_span": 0.3,
+  "response_delay": 0.01,
+  "sensor_timeout": 0.5,
+  "baseline_timeout": 0.1
+}

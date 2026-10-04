@@ -1,5 +1,6 @@
 #include <ros/ros.h>
 #include <cmath>
+#include <thread>
 #include "PX4CtrlFSM.h"
 
 int main(int argc, char* argv[]) {
@@ -51,7 +52,7 @@ int main(int argc, char* argv[]) {
 
     // ROS callbacks execute on this thread, so reset and update cannot race.
     if (controller.ready())
-        ROS_INFO("[px4ctrl] UADL controller ready (configuration %s)", parameters.method.c_str());
+        ROS_INFO("[px4ctrl] UADL controller ready");
     else
         ROS_ERROR("[px4ctrl] UADL controller configuration failed: %s", controller.lastStatus().c_str());
     ROS_INFO("[px4ctrl] Waiting for odometry, IMU, FCU state and RC/battery inputs");
@@ -66,11 +67,18 @@ int main(int argc, char* argv[]) {
     fsm.rc_data.enter_hover_mode = false;
     fsm.rc_data.enter_command_mode = false;
     fsm.takeoff_land_data.triggered = false;
-    ros::Rate rate(parameters.ctrl_freq_max);
+    using Clock = std::chrono::steady_clock;
+    const auto period = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(1.0 / parameters.ctrl_freq_max));
+    auto release = Clock::now();
     while (ros::ok()) {
+        std::this_thread::sleep_until(release);
         ros::spinOnce();
-        fsm.process();
-        rate.sleep();
+        fsm.process(release);
+        release += period;
+        // Preserve scheduled releases after an overrun; never reset the
+        // acceptance cutoff to the delayed start of an individual solve.
+        while (release + period <= Clock::now()) release += period;
     }
     return 0;
 }

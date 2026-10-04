@@ -4,8 +4,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
-#include <random>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -43,15 +43,9 @@ void testEmptyPosteriorAndBounds() {
     require(response.valid, "empty response is valid");
     near(response.mean, h0, "empty response mean");
     near(response.variance, config.variance_a + h0 * h0 * config.variance_b, "empty composite variance");
-    near(response.error_bound, config.rkhs_bound * response.sigma, "empty Eq.34 bound");
+    // Empty window: the sum in Eq. (40) is zero and sigma_q^2 = k_q(xi, xi).
+    near(response.error_bound, config.rkhs_bound * response.sigma, "empty Eq. (40) bound");
     near(response.historical_error, 0.0, "empty historical contamination");
-    const auto bound = gp.globalBound(0.7, 1.3, 0.4);
-    require(bound.valid && bound.error_bound >= response.error_bound, "empty uniform bound covers response");
-    const auto model = gp.modelBounds(0.7, 0.9, 1.3);
-    require(model.valid, "empty posterior model envelope");
-    near(model.abs_f, 0.7, "empty f envelope");
-    near(model.g_min, 0.9, "empty lower g envelope");
-    near(model.g_max, 1.3, "empty upper g envelope");
 }
 
 void testAnalyticSingleObservation() {
@@ -103,8 +97,8 @@ void testAnalyticSingleObservation() {
         near(r.variance, p.var_f + 2.0 * u * p.cov_fg + u * u * p.var_g,
              "response variance includes cross covariance");
         near(r.historical_error, std::abs(kq / gram) * sample.error_bound,
-             "Eq.34 absolute historical weight");
-        near(r.error_bound, config.rkhs_bound * r.sigma + r.historical_error, "full Eq.34 bound");
+             "Eq. (40) absolute historical weight");
+        near(r.error_bound, config.rkhs_bound * r.sigma + r.historical_error, "full Eq. (40) bound");
     }
 }
 
@@ -173,12 +167,9 @@ void testFullStateAndRawGain() {
     const auto prediction = gp.predict(sample.state, 0.0, 1.0);
     require(prediction.valid && prediction.g < 0.0, "raw negative posterior gain retained");
     require(prediction.response(2.0).valid, "raw negative gain still yields valid GP response");
-    const auto model = gp.modelBounds(0.2, 0.8, 1.2);
-    require(model.valid && model.g_min < 0.0 && model.g_min <= prediction.g,
-            "global gain envelope is not floored");
 }
 
-void testUniformEnvelopesAndValidation() {
+void testPredictedSetBoundAndValidation() {
     uadl::GPConfig config;
     config.rkhs_bound = 3.0;
     uadl::OnlineGP gp(config);
@@ -191,40 +182,41 @@ void testUniformEnvelopesAndValidation() {
         sample.y = sample.f0 + sample.g0 * sample.u_ex + 0.02 * (i + 1);
         sample.error_bound = 0.04;
         sample.timestamp = 1.0 + 0.02 * i;
-        require(gp.insert(sample).accepted, "envelope fixture insertion accepted");
+        require(gp.insert(sample).accepted, "set-bound fixture insertion accepted");
     }
-    const auto bound = gp.globalBound(0.8, 1.5, 2.0);
-    const auto model = gp.modelBounds(0.8, 0.5, 1.5);
-    require(bound.valid && model.valid, "uniform envelopes valid");
-    for (int i = 0; i < 21; ++i) {
+    // Eq. (40) over a predicted state set and an input interval dominates
+    // every pointwise bound inside the set: at a fixed state the bound is
+    // convex in h0 = f0 + g0 u, so the interval endpoints attain the maximum.
+    std::vector<uadl::State> states;
+    std::vector<double> f0, g0;
+    for (int i = 0; i < 7; ++i) {
         uadl::State state;
         for (int j = 0; j < 6; ++j) state(j) = 0.2 * std::sin(0.37 * i + 0.29 * j);
-        const double f0 = 0.8 * std::sin(0.31 * i);
-        const double g0 = 1.0 + 0.5 * std::cos(0.47 * i);
-        const auto prediction = gp.predict(state, f0, g0);
-        require(prediction.valid, "envelope query posterior valid");
-        require(std::abs(prediction.f) <= model.abs_f + 1e-10 &&
-                prediction.g >= model.g_min - 1e-10 && prediction.g <= model.g_max + 1e-10,
-                "uniform model envelope covers varying prior values");
-        for (double u : {-2.0, -1.0, 0.0, 1.0, 2.0}) {
+        states.push_back(state);
+        f0.push_back(0.8 * std::sin(0.31 * i));
+        g0.push_back(1.0 + 0.5 * std::cos(0.47 * i));
+    }
+    const auto bound = gp.predictedSetBound(states, f0, g0, -1.5, 2.0);
+    require(bound.valid, "predicted-set bound valid");
+    for (std::size_t i = 0; i < states.size(); ++i) {
+        const auto prediction = gp.predict(states[i], f0[i], g0[i]);
+        require(prediction.valid, "set query posterior valid");
+        for (int k = 0; k <= 20; ++k) {
+            const double u = -1.5 + 3.5 * k / 20.0;
             const auto response = prediction.response(u);
             require(response.valid && response.error_bound <= bound.error_bound + 1e-10,
-                    "uniform Eq.34 envelope dominates query bounds");
+                    "predicted-set Eq. (40) bound dominates interior inputs");
         }
     }
-    // A distant query keeps prior uncertainty: the uniform envelope cannot
-    // be replaced by the much smaller posterior variance at training data.
-    const auto far = gp.response(uadl::State::Constant(100.0), 0.8, 1.5, 2.0);
-    require(far.valid && far.error_bound <= bound.error_bound, "uniform bound covers unseen states");
+    require(!gp.predictedSetBound(states, f0, g0, 2.0, -1.5).valid, "reversed input interval rejected");
+    require(!gp.predictedSetBound({}, {}, {}, -1.0, 1.0).valid, "empty predicted set rejected");
 
     const double nan = std::numeric_limits<double>::quiet_NaN();
     require(!gp.predict(uadl::State::Constant(nan), 0.0, 1.0).valid, "NaN state rejected");
     require(gp.predict(uadl::State::Zero(), 0.0, -1.0).status == uadl::GPStatus::InvalidPrior,
             "nonpositive offline prior gain rejected");
-    require(!gp.predict(uadl::State::Zero(), 0.0, 0.5e-6).valid, "near-singular offline prior rejected");
+    require(!gp.predict(uadl::State::Zero(), 0.0, 0.5e-6).valid, "raw gain below 1e-6 rejected (Remark 3)");
     require(!gp.response(uadl::State::Zero(), 0.0, 1.0, nan).valid, "NaN query input rejected");
-    require(!gp.globalBound(-1.0, 1.0, 1.0).valid, "negative global absolute bound rejected");
-    require(!gp.modelBounds(1.0, 2.0, 1.0).valid, "reversed prior interval rejected");
 
     uadl::GPSample invalid;
     invalid.timestamp = 3.0;
@@ -241,96 +233,71 @@ void testUniformEnvelopesAndValidation() {
     require(!uadl::OnlineGP(config).valid(), "configuration cannot exceed 100 Hz");
 }
 
-void testCertifiedDomainCovering() {
+void testContinuousRegionBound() {
     uadl::GPConfig config;
-    config.variance_a = 1.3;
-    config.variance_b = 0.7;
-    config.noise_variance = 0.01;
-    config.rkhs_bound = 2.0;
+    config.rkhs_bound = 4.0;
+    config.noise_variance = 0.2;
     uadl::OnlineGP gp(config);
-    const uadl::State lower = uadl::State::Constant(-0.01);
-    const uadl::State upper = uadl::State::Constant(0.01);
-    const double abs_f = 0.2, abs_g = 1.1, abs_u = 2.0;
-    const double H = abs_f + abs_g * abs_u;
-    const auto empty = gp.domainBound(lower, upper, abs_f, abs_g, abs_u, 8);
-    near(empty.error_bound, gp.globalBound(abs_f, abs_g, abs_u).error_bound,
-         "empty domain bound equals exact prior envelope");
-    require(empty.valid, "empty domain certificate valid");
+    uadl::GPSample sample;
+    sample.f0 = 0.4;
+    sample.g0 = 1.2;
+    sample.u_ex = -0.7;
+    sample.y = -0.31;
+    sample.error_bound = 0.12;
+    sample.timestamp = 1.0;
+    require(gp.insert(sample).accepted, "continuous-region observation accepted");
 
-    std::mt19937 random(1729);
-    std::uniform_real_distribution<double> unit(-1.0, 1.0);
-    std::vector<uadl::GPSample> samples;
-    for (int i = 0; i < 16; ++i) {
-        uadl::GPSample sample;
-        for (int j = 0; j < 6; ++j) sample.state(j) = 0.009 * unit(random);
-        sample.f0 = abs_f;
-        sample.g0 = abs_g;
-        sample.u_ex = i % 2 ? abs_u : -abs_u;
-        sample.y = sample.f0 + sample.g0 * sample.u_ex;
-        sample.error_bound = 0.0001 * (1 + i % 3);
-        sample.timestamp = 1.0 + 0.02 * i;
-        require(gp.insert(sample).accepted, "domain fixture observation accepted");
-        samples.push_back(sample);
-    }
-    const auto certified = gp.domainBound(lower, upper, abs_f, abs_g, abs_u, 8);
-    require(certified.valid && certified.error_bound < 0.8 * empty.error_bound,
-            "covered small domain admits genuine contraction below empty-window bound");
-    require(certified.error_bound <= gp.globalBound(abs_f, abs_g, abs_u).error_bound,
-            "domain certificate never exceeds global certificate");
+    // A degenerate box reduces to the independent scalar posterior oracle
+    // exercised above; interval solving must preserve this limiting case.
+    uadl::GPStateRegion point;
+    point.f0_lower = point.f0_upper = sample.f0;
+    point.g0_lower = point.g0_upper = sample.g0;
+    const auto region_point = gp.predictedRegionBound(point, -0.9, 0.8);
+    const auto discrete_point = gp.predictedSetBound({sample.state}, {sample.f0}, {sample.g0}, -0.9, 0.8);
+    require(region_point.valid && discrete_point.valid, "degenerate region has a valid bound");
+    near(region_point.error_bound, discrete_point.error_bound, "degenerate region matches Eq. (40)");
+    near(region_point.f_lower, discrete_point.f_lower, "degenerate drift lower bound");
+    near(region_point.f_upper, discrete_point.f_upper, "degenerate drift upper bound");
+    near(region_point.g_lower, discrete_point.g_lower, "degenerate gain lower bound");
+    near(region_point.g_upper, discrete_point.g_upper, "degenerate gain upper bound");
 
-    // Independent dense Gaussian conditioning oracle (not predict()) checks
-    // thousands of random state/h0 queries plus every state-box corner.
-    const Eigen::Index count = static_cast<Eigen::Index>(samples.size());
-    Eigen::MatrixXd gram(count, count);
-    Eigen::VectorXd hi(count), errors(count);
-    for (Eigen::Index i = 0; i < count; ++i) {
-        hi(i) = samples[i].f0 + samples[i].g0 * samples[i].u_ex;
-        errors(i) = samples[i].error_bound;
-    }
-    for (Eigen::Index i = 0; i < count; ++i)
-        for (Eigen::Index j = 0; j < count; ++j) {
-            const double distance = (samples[i].state - samples[j].state).squaredNorm();
-            gram(i, j) = (config.variance_a + hi(i) * hi(j) * config.variance_b) *
-                         std::exp(-distance / (2 * config.lengthscale * config.lengthscale));
-            if (i == j) gram(i, j) += config.noise_variance;
+    // The prior varies over this entire box. Interior states and inputs are
+    // not used by the bounding implementation, which operates analytically
+    // on the box and the two input endpoints.
+    uadl::GPStateRegion region;
+    region.state_lower = uadl::State::Constant(-0.25);
+    region.state_upper = uadl::State::Constant(0.3);
+    region.f0_lower = 0.1;
+    region.f0_upper = 0.7;
+    region.g0_lower = 0.9;
+    region.g0_upper = 1.4;
+    const auto bound = gp.predictedRegionBound(region, -1.1, 0.8);
+    require(bound.valid, "continuous state-input box bound valid");
+    for (int i = 0; i <= 20; ++i) {
+        uadl::State state;
+        for (int j = 0; j < 6; ++j)
+            state(j) = -0.25 + 0.55 * (0.5 + 0.5 * std::sin(0.37 * i + 0.29 * j));
+        const double f0 = 0.4 + 0.3 * std::sin(0.47 * i);
+        const double g0 = 1.15 + 0.25 * std::cos(0.53 * i);
+        const auto prediction = gp.predict(state, f0, g0);
+        require(prediction.valid && prediction.f >= bound.f_lower - 1e-10 &&
+                prediction.f <= bound.f_upper + 1e-10 &&
+                prediction.g >= bound.g_lower - 1e-10 &&
+                prediction.g <= bound.g_upper + 1e-10, "raw posterior enclosed throughout state box");
+        for (int j = 0; j <= 10; ++j) {
+            const auto response = prediction.response(-1.1 + 1.9 * j / 10.0);
+            require(response.valid && response.sigma <= bound.sigma_bound + 1e-10 &&
+                    response.historical_error <= bound.historical_error + 1e-10 &&
+                    response.error_bound <= bound.error_bound + 1e-10,
+                    "continuous region encloses pointwise uncertainty and historical errors");
         }
-    const Eigen::LDLT<Eigen::MatrixXd> independent_factor(gram);
-    auto oracle = [&](const uadl::State& state, double h) {
-        Eigen::VectorXd k(count);
-        for (Eigen::Index i = 0; i < count; ++i)
-            k(i) = (config.variance_a + h * hi(i) * config.variance_b) *
-                   std::exp(-(samples[i].state - state).squaredNorm() /
-                            (2 * config.lengthscale * config.lengthscale));
-        const Eigen::VectorXd w = independent_factor.solve(k);
-        const double variance = config.variance_a + h*h*config.variance_b - k.dot(w);
-        return config.rkhs_bound * std::sqrt(std::max(0.0, variance)) + w.cwiseAbs().dot(errors);
-    };
-    for (int i = 0; i < 2000; ++i) {
-        uadl::State state;
-        for (int j = 0; j < 6; ++j) state(j) = 0.01 * unit(random);
-        const double h = H * unit(random);
-        require(oracle(state, h) <= certified.error_bound + 1e-9,
-                "cell-cover bound dominates independent random-query Eq.34 oracle");
     }
-    for (int mask = 0; mask < 64; ++mask) {
-        uadl::State state;
-        for (int j = 0; j < 6; ++j) state(j) = (mask & (1 << j)) ? upper(j) : lower(j);
-        for (double h : {-H, 0.0, H})
-            require(oracle(state, h) <= certified.error_bound + 1e-9,
-                    "cell-cover bound includes all box corners and h0 extremes");
-    }
-    const auto singleton = gp.domainBound(uadl::State::Zero(), uadl::State::Zero(), abs_f, abs_g, abs_u, 8);
-    near(singleton.error_bound, std::max(oracle(uadl::State::Zero(), -H), oracle(uadl::State::Zero(), H)),
-         "zero-radius covering reduces to convex h0 endpoint bound", 1e-7);
-    const auto wide = gp.domainBound(uadl::State::Constant(-100.), uadl::State::Constant(100.), abs_f, abs_g, abs_u, 1);
-    near(wide.error_bound, gp.globalBound(abs_f, abs_g, abs_u).error_bound,
-         "broad unseen domain safely falls back to global bound");
-    require(!gp.domainBound(upper, lower, abs_f, abs_g, abs_u).valid, "reversed box rejected");
-    require(!gp.domainBound(lower, upper, abs_f, abs_g, abs_u, 0).valid, "zero covering budget rejected");
-    require(!gp.domainBound(lower, upper, abs_f, abs_g, abs_u, 257).valid, "excessive covering budget rejected");
-    require(!gp.domainBound(uadl::State::Constant(std::numeric_limits<double>::quiet_NaN()), upper,
-                            abs_f, abs_g, abs_u).valid, "nonfinite covering domain rejected");
-    std::cout << "Certified tight-domain bound: " << empty.error_bound << " -> " << certified.error_bound << '\n';
+    region.state_lower(0) = region.state_upper(0) + 1.0;
+    require(!gp.predictedRegionBound(region, -1.0, 1.0).valid, "reversed state region rejected");
+    region.state_lower(0) = -0.25;
+    region.g0_lower = -0.1;
+    require(gp.predictedRegionBound(region, -1.0, 1.0).status == uadl::GPStatus::InvalidPrior,
+            "region crossing invalid raw prior gain rejected");
 }
 
 }  // namespace
@@ -340,8 +307,8 @@ int main() {
     testAnalyticSingleObservation();
     testGateTimestampsWindowAndCopy();
     testFullStateAndRawGain();
-    testUniformEnvelopesAndValidation();
-    testCertifiedDomainCovering();
+    testPredictedSetBoundAndValidation();
+    testContinuousRegionBound();
     std::cout << "All online GP tests passed.\n";
     return EXIT_SUCCESS;
 }

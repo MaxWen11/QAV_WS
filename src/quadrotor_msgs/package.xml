@@ -2,7 +2,6 @@
   <name>quadrotor_msgs</name>
   <version>0.0.0</version>
   <description>quadrotor_msgs</description>
-  <maintainer email="todo@todo.todo">Kartik Mohta</maintainer>
   <url>http://ros.org/wiki/quadrotor_msgs</url>
   <license>BSD</license>
   <buildtool_depend>catkin</buildtool_depend>

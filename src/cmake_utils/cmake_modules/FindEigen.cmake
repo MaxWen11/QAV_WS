@@ -92,7 +92,6 @@ unset(EIGEN_FOUND)
 # Search user-installed locations first, so that we prefer user installs
 # to system installs where both exist.
 #
-# TODO: Add standard Windows search locations for Eigen.
 list(APPEND EIGEN_CHECK_INCLUDE_DIRS
   /usr/local/include
   /usr/local/homebrew/include # Mac OS X

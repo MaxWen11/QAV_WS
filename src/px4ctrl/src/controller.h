@@ -5,17 +5,18 @@
 #include <Eigen/Geometry>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "input.h"
 #include "online_gp.h"
 #include "tube_mpc.h"
 #include "control_geometry.h"
-#ifdef UADL_WITH_TORCH
+#include "reference_continuation.h"
 #include <torch/script.h>
-#endif
 
 struct Desired_State_t {
     Eigen::Vector3d p = Eigen::Vector3d::Zero();
@@ -40,8 +41,9 @@ struct Controller_Output_t {
 };
 
 // Uncertainty-aware dynamics learning controller (Sections IV-B and V):
-// frozen offline prior + task-error GP (Eqs. 18-23), protected inverse,
-// axis-wise homothetic tube MPC with a maintained feasible backup.
+// frozen offline prior (Eq. 15) + task-error GP (Eqs. 18-26), protected
+// inverse (Eq. 28), and axis-wise homothetic tube MPC (Eqs. 45-48) with a
+// maintained feasible backup (Remark 8).
 class Controller {
 public:
     explicit Controller(Parameter_t& parameters);
@@ -58,6 +60,8 @@ public:
     // Reset adaptation, plans and command history; retain frozen priors/kernels.
     void resetOnline();
     bool scheduleReset(double epoch);
+    // Scheduled release of a control cycle; the solver cutoff and the
+    // command deadline are measured from this instant.
     void beginCycle(std::chrono::steady_clock::time_point started);
     bool publicationAllowed() const;
     void commitPublished(const Controller_Output_t&, const ros::Time& stamp);
@@ -68,8 +72,7 @@ private:
     struct Context {
         std::vector<uadl::OnlineGP> gp;
         std::vector<uadl::TubeMPC> mpc;
-        Desired_State_t reference;
-        double reference_stamp = 0.0;
+        uadl::ReferenceContinuation reference_path;
         bool have_reference = false;
     };
     struct ExecutedCommand {
@@ -79,7 +82,7 @@ private:
     struct Evaluation {
         bool valid = false;
         bool used_backup = false;
-        bool envelope_saturated = false;
+        bool envelope_exceeded = false;
         bool inside_domain = true;
         uadl::MappedCommand mapped;
         std::array<uadl::GPPrediction, 3> posterior;
@@ -88,6 +91,18 @@ private:
         Eigen::Vector3d envelopes = Eigen::Vector3d::Zero();
         std::string status;
     };
+    // A solve owns its complete cycle snapshot. An overdue worker cannot
+    // mutate the accepted controller or delay backup publication.
+    struct SolveJob {
+        Context context;
+        Evaluation evaluation;
+        std::mutex mutex;
+        std::condition_variable completed;
+        bool done = false;
+        Clock::time_point finished;
+    };
+    std::shared_ptr<SolveJob> solve_job_;
+    std::array<uadl::GPStateRegion, 3> prior_regions_;
     Context accepted_;
     std::unique_ptr<Context> pending_;
     std::deque<ExecutedCommand> history_;
@@ -101,20 +116,18 @@ private:
     bool active_cycle_ = false;
     std::string status_;
     uadl::ThrustConfig thrust_config_;
-#ifdef UADL_WITH_TORCH
     std::array<torch::jit::script::Module, 3> prior_models_;
-#endif
     bool configure();
     bool priors(const std::vector<uadl::State>& states,
                 std::vector<Eigen::Vector3d>& f0, std::vector<Eigen::Vector3d>& g0);
     bool priors(const uadl::State&, Eigen::Vector3d& f0, Eigen::Vector3d& g0);
     bool insideDomain(const uadl::State&) const;
     double historicalError(int axis, double executed_input) const;
-    double residualMargin(int axis) const;
-    Eigen::Vector3d lastExecutedInput() const;
-    std::vector<uadl::State> predictedStates(const uadl::State&, const Desired_State_t&) const;
-    bool targetEnvelopes(const Context&, const Desired_State_t&, const uadl::State&,
-                         Eigen::Vector3d& targets);
+    double residualMargin(int axis, double command_bound, double reference_hold_bound) const;
+    uadl::SafetyLimits safetyLimits(int axis, const uadl::ReferenceContinuation&, double stamp) const;
+    bool targetEnvelopes(const Context&, Eigen::Vector3d& targets,
+        std::array<Eigen::Vector2d, 3>& correction_domains,
+        Eigen::Vector3d& command_bounds, const Eigen::Vector3d& reference_hold_bounds) const;
     Evaluation evaluate(Context&, const Desired_State_t&, const uadl::State&,
         const Eigen::Vector3d& f0, const Eigen::Vector3d& g0, double voltage,
         double stamp, const Clock::time_point& cutoff, bool backup_only);
